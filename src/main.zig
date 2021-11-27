@@ -10,11 +10,23 @@ const I = std.meta.Int(.unsigned, std.math.log2_int(u8, step_size));
 const debug = true;
 
 const Options = struct {
+    /// This field may be any container type.  If it includes methods such as `on_field` 
+    /// with the following signature, they will be called when `field` is found: 
+    ///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
+    /// The return type Ret must match the type of `field`.
+    /// If provided, this parser takes precedence over `T.__parser`.
     user_parser: ?type = @as(?type, null),
+
+    /// allocator to use when pointer or slice fields are found
     allocator: *mem.Allocator,
-    skip_unknown_fields: bool = false,
+
+    /// if false, unknown fields will cause an error
+    /// otherwise they will be skipped
+    skip_unknown_fields: bool = true,
 };
 
+/// if T includes a `pub const __parser` declaration, it will be used in the same way
+/// as `options.user_parser`
 pub fn parse(comptime T: type, reader: anytype, options: Options) !T {
     var buffered_reader = std.io.bufferedReader(reader);
     var parser = try Parser.init(options.allocator, &buffered_reader);
@@ -34,7 +46,6 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             const inner_options: Options = if (@hasDecl(T, "__parser")) .{
                 .user_parser = @field(T, "__parser"),
                 .allocator = options.allocator,
-                // .skip_ws = options.skip_ws,
             } else options;
             try parser.expectChar('{', reader);
             var result: T = undefined;
@@ -59,7 +70,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                             log("found key {s}", .{key});
                             @field(result, field.name) =
                                 if (inner_options.user_parser != null and @hasDecl(inner_options.user_parser.?, "on_" ++ field.name))
-                                try @field(inner_options.user_parser.?, "on_" ++ field.name)(reader, inner_options.allocator)
+                                try @field(inner_options.user_parser.?, "on_" ++ field.name)(reader, inner_options.allocator, parser)
                             else
                                 try parseImpl(field.field_type, parser, reader, inner_options);
                             found = true;
@@ -67,9 +78,11 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                         }
                     }
 
-                    if (inner_options.skip_unknown_fields and !found) {
-                        try parser.skipValue(reader);
-                        continue;
+                    if (!found) {
+                        if (inner_options.skip_unknown_fields) {
+                            try parser.skipValue(reader);
+                            continue;
+                        } else return error.UnknownField;
                     }
                 } else if (next_char == ',') {
                     // nothing
@@ -100,7 +113,12 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                     else => return error.InvalidToken,
                 }
             },
-            else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer: {s}", .{@tagName(tinfo.Pointer.size)})),
+            .One => {
+                var result = try options.allocator.create(tinfo.Pointer.child);
+                result.* = try parseImpl(tinfo.Pointer.child, parser, reader, options);
+                return result;
+            },
+            else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer size: {s}", .{@tagName(tinfo.Pointer.size)})),
         },
         .Int => return parser.readInt(T, reader),
         .Float => return parser.readFloat(T, reader),
@@ -674,6 +692,22 @@ test "nexts" {
     try expectNext(&p, reader, .{ .char = '}' });
 }
 
+test "span multiple blocks" {
+    // testing.log_level = .debug;
+    const input =
+        \\{                 "l":[10000,200000,3000000,18446744073709551615]}
+    ;
+    var p: Parser = undefined;
+    try testing.expectEqual(@as(usize, 64), p.input_buf.len);
+    try testing.expectEqual(@as(usize, 66), input.len);
+    try testing.expectEqual(@as(u8, '5'), input[63]);
+    var fbs = std.io.fixedBufferStream(input);
+    const T = struct { l: []const usize };
+    const result = try parse(T, fbs.reader(), .{ .allocator = std.heap.page_allocator });
+    try testing.expectEqual(@as(usize, 4), result.l.len);
+    try testing.expectEqual(@as(usize, 18446744073709551615), result.l[3]);
+}
+
 test "twitter.json" {
     // testing.log_level = .debug;
     const f = try std.fs.cwd().openFile("testdata/twitter.json", .{ .read = true });
@@ -712,27 +746,15 @@ test "basic" {
         custom: u8,
         m: u128,
         n: f64,
+        o: *u8,
 
-        // pub const __parser = struct {
-        //     pub fn on_custom(reader: anytype, _: ?*mem.Allocator) !u8 {
-        //         var intbuf: [20]u8 = undefined;
-        //         var ptr: [*]u8 = &intbuf;
-
-        //         var next_char = try skipWs(reader);
-        //         while (true) {
-        //             if ('0' <= next_char and next_char <= '9') {
-        //                 ptr[0] = next_char;
-        //                 ptr += 1;
-        //             } else {
-        //                 try reader.fifo.unget(&.{next_char});
-        //                 break;
-        //             }
-        //             next_char = try readByte(reader);
-        //         }
-        //         const len = @ptrToInt(ptr) - @ptrToInt(&intbuf);
-        //         return std.fmt.parseInt(u8, intbuf[0..len], 10);
-        //     }
-        // };
+        pub const __parser = struct {
+            pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
+                _ = reader;
+                _ = try p.nextToken(reader, p.token_buf.len);
+                return 55;
+            }
+        };
     };
     const input =
         \\ { "a" : 42 ,
@@ -749,11 +771,14 @@ test "basic" {
         \\ "l":[10000,200000,3000000,18446744073709551615],
         \\ "m": 340282366920938463463374607431768211455,
         \\ "n": 1.7976931348623157e+308,
-        \\"custom":69,
+        \\"custom":66,
+        \\ "o": 101,
         \\}
     ;
     var fbs = std.io.fixedBufferStream(input);
-    const result = try parse(T, fbs.reader(), .{ .allocator = std.heap.page_allocator });
+    const result = try parse(T, fbs.reader(), .{
+        .allocator = std.heap.page_allocator,
+    });
     try testing.expectEqual(@as(u8, 42), result.a);
     try testing.expectEqualStrings("string", result.b);
     try testing.expect(result.c);
@@ -766,23 +791,21 @@ test "basic" {
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, result.j);
     try testing.expectEqual(@as(u8, 42), result.k.a);
     try testing.expectEqualSlices(usize, &[_]usize{ 10_000, 200_000, 3_000_000, std.math.maxInt(usize) }, result.l);
-    try testing.expectEqual(@as(u8, 69), result.custom);
+    try testing.expectEqual(@as(u8, 55), result.custom);
     try testing.expectEqual(@as(u128, std.math.maxInt(u128)), result.m);
     try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.n, std.math.epsilon(f64));
 }
 
-test "span multiple blocks" {
-    // testing.log_level = .debug;
+test "unknown field" {
     const input =
-        \\{                 "l":[10000,200000,3000000,18446744073709551615]}
+        \\{"a":1}
     ;
-    try testing.expectEqual(@as(usize, 66), input.len);
-    try testing.expectEqual(@as(u8, '5'), input[63]);
+    const T = struct { b: u8 };
     var fbs = std.io.fixedBufferStream(input);
-    const T = struct { l: []const usize };
-    const result = try parse(T, fbs.reader(), .{ .allocator = std.heap.page_allocator });
-    try testing.expectEqual(@as(usize, 4), result.l.len);
-    try testing.expectEqual(@as(usize, 18446744073709551615), result.l[3]);
+    try testing.expectError(error.UnknownField, parse(T, fbs.reader(), .{
+        .allocator = std.heap.page_allocator,
+        .skip_unknown_fields = false,
+    }));
 }
 
 // pub const log_level = .debug;

@@ -162,8 +162,39 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 else => return error.InvalidEnumToken,
             }
         },
+        .Array => {
+            try parser.skipWs(reader);
+            switch (parser.input_buf[parser.index]) {
+                '[' => {
+                    try parser.incIndex(reader);
+                    var result: T = undefined;
+                    // TODO errdefer free
+                    var i: usize = 0;
+
+                    while (i < result.len) : (i += 1) {
+                        if (i > 0) try parser.expectChar(',', reader);
+                        result[i] = try parseImpl(tinfo.Array.child, parser, reader, options);
+                    }
+                    const char = parser.nextChar(reader) catch return error.UnexpectedEndOfJson;
+                    switch (char) {
+                        ']' => {},
+                        else => return error.UnexpectedToken,
+                    }
+                    return result;
+                },
+                '"' => {
+                    if (tinfo.Array.child != u8) return error.UnexpectedToken;
+                    try parser.incIndex(reader);
+                    var result: T = undefined;
+                    const str = try parser.readString(reader);
+                    mem.copy(u8, &result, str);
+                    return result;
+                },
+                else => return error.UnexpectedToken,
+            }
+            unreachable;
+        },
         // TODO: .Union => {},
-        // TODO: .Array => {},
         else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
     }
 }
@@ -772,6 +803,8 @@ test "basic" {
         o: *u8,
         p: E,
         q: E,
+        r: [2]u8,
+        s: [2]u8,
 
         pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
             _ = reader;
@@ -798,6 +831,8 @@ test "basic" {
         \\ "o": 101,
         \\ "p": 0,
         \\ "q": "a",
+        \\ "r": [1,2],
+        \\ "s": "ab",
         \\}
     ;
     var fbs = std.io.fixedBufferStream(input);
@@ -821,6 +856,8 @@ test "basic" {
     try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.n, std.math.epsilon(f64));
     try testing.expectEqual(E.a, result.p);
     try testing.expectEqual(E.a, result.q);
+    try testing.expectEqual([_]u8{ 1, 2 }, result.r);
+    try testing.expectEqualStrings("ab", &result.s);
 }
 
 test "unknown field" {

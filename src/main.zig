@@ -9,24 +9,19 @@ const step_size = 64;
 const I = std.meta.Int(.unsigned, std.math.log2_int(u8, step_size));
 const debug = true;
 
-const Options = struct {
-    /// This field may be any container type.  If it includes methods such as `on_field` 
-    /// with the following signature, they will be called when `field` is found: 
-    ///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
-    /// The return type Ret must match the type of `field`.
-    /// If provided, this parser takes precedence over `T.__parser`.
-    user_parser: ?type = @as(?type, null),
-
+pub const Options = struct {
     /// allocator to use when pointer or slice fields are found
     allocator: *mem.Allocator,
 
-    /// if false, unknown fields will cause an error
-    /// otherwise they will be skipped
+    /// if false, unknown fields will cause an error.UnknownField
+    /// otherwise they will be skipped. defaults to true.
     skip_unknown_fields: bool = true,
 };
 
-/// if T includes a `pub const __parser` declaration, it will be used in the same way
-/// as `options.user_parser`
+/// if T includes methods such as `on_field` 
+/// with the following signature, they will be called when `field` is found: 
+///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
+/// The return type Ret must match the type of `field`.
 pub fn parse(comptime T: type, reader: anytype, options: Options) !T {
     var buffered_reader = std.io.bufferedReader(reader);
     var parser = try Parser.init(options.allocator, &buffered_reader);
@@ -43,55 +38,50 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
     const tinfo = @typeInfo(T);
     switch (tinfo) {
         .Struct => {
-            const inner_options: Options = if (@hasDecl(T, "__parser")) .{
-                .user_parser = @field(T, "__parser"),
-                .allocator = options.allocator,
-            } else options;
             try parser.expectChar('{', reader);
             var result: T = undefined;
 
             while (true) {
-                // parser.dump();
                 const next_char = parser.nextChar(reader) catch |err| switch (err) {
                     error.EndOfStream => break,
                     else => return err,
                 };
                 log("parseImpl next_char '{c}'", .{next_char});
-                if (next_char == '"') {
-                    const key = parser.readString(reader) catch |err| switch (err) {
-                        error.EndOfStream => break,
-                        else => return err,
-                    };
-                    log("key {s}", .{key});
-                    try parser.expectChar(':', reader);
-                    var found = false;
-                    inline for (std.meta.fields(T)) |field| {
-                        if (std.mem.eql(u8, key, field.name)) {
-                            log("found key {s}", .{key});
-                            @field(result, field.name) =
-                                if (inner_options.user_parser != null and @hasDecl(inner_options.user_parser.?, "on_" ++ field.name))
-                                try @field(inner_options.user_parser.?, "on_" ++ field.name)(reader, inner_options.allocator, parser)
-                            else
-                                try parseImpl(field.field_type, parser, reader, inner_options);
-                            found = true;
-                            break;
+                switch (next_char) {
+                    '"' => {
+                        const key = parser.readString(reader) catch |err| switch (err) {
+                            error.EndOfStream => break,
+                            else => return err,
+                        };
+                        log("key {s}", .{key});
+                        try parser.expectChar(':', reader);
+                        inline for (std.meta.fields(T)) |field| {
+                            if (std.mem.eql(u8, key, field.name)) {
+                                log("found key {s}", .{key});
+                                @field(result, field.name) =
+                                    if (@hasDecl(T, "on_" ++ field.name))
+                                    try @field(T, "on_" ++ field.name)(reader, options.allocator, parser)
+                                else
+                                    try parseImpl(field.field_type, parser, reader, options);
+                                break;
+                            }
+                        } else {
+                            if (options.skip_unknown_fields) {
+                                try parser.skipValue(reader);
+                                continue;
+                            } else return error.UnknownField;
                         }
-                    }
-
-                    if (!found) {
-                        if (inner_options.skip_unknown_fields) {
-                            try parser.skipValue(reader);
-                            continue;
-                        } else return error.UnknownField;
-                    }
-                } else if (next_char == ',') {
-                    // nothing
-                } else if (next_char == ']') {
-                    parser.last_char = next_char;
-                    return result;
-                } else if (next_char == '}') {
-                    parser.last_char = next_char;
-                    break;
+                    },
+                    ',' => {}, // TODO: don't allow trailing comma
+                    ']' => {
+                        parser.last_char = next_char;
+                        return result;
+                    },
+                    '}' => {
+                        parser.last_char = next_char;
+                        break;
+                    },
+                    else => return error.InvalidCharacter,
                 }
             } // end while(true)
             try parser.expectChar('}', reader);
@@ -138,6 +128,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             };
         },
         .Optional => {
+            try parser.skipWs(reader);
             const next_char = parser.input_buf[parser.index];
             return if (next_char == 'n') blk: {
                 const tok = try parser.nextToken(reader, 4);
@@ -191,9 +182,12 @@ pub const Parser = struct {
     block: Block,
     /// the current index within input_buf
     index: I = 0,
-    input_buf: [step_size]u8 = [1]u8{0x20} ** step_size,
+    input_buf: [step_size]u8 = undefined,
+    /// temporary buffer for keys and string values
     string_buf: std.ArrayListUnmanaged(u8) = .{},
+    /// temporary buffer for numbers, true, false and null tokens
     token_buf: [40]u8 = undefined,
+    /// single character lookbehind
     last_char: ?u8 = null,
 
     pub fn init(allocator: *mem.Allocator, reader: anytype) !Parser {
@@ -425,6 +419,7 @@ pub const Parser = struct {
             }
             parser.block = try parser.nextBlock(reader);
         }
+        // skip trailing '"'
         if (@addWithOverflow(I, parser.index, 1, &parser.index))
             parser.block = try parser.nextBlock(reader);
     }
@@ -447,7 +442,7 @@ pub const Parser = struct {
         while (true) {
             try list.append(try parseImpl(T, parser, reader, options));
             const next_char = parser.nextChar(reader) catch |err| switch (err) {
-                error.EndOfStream => break,
+                error.EndOfStream => return error.UnterminatedArray,
                 else => return err,
             };
             switch (next_char) {
@@ -519,7 +514,6 @@ pub const Parser = struct {
                 else => {
                     std.log.err("skipValue unexpected character '{c}' depth {}\n", .{ c, depth });
                     return error.Unexpected;
-                    // parser.index = @intCast(I, parser.nextStructuralIndex());
                 },
             }
         }
@@ -528,13 +522,13 @@ pub const Parser = struct {
     fn dump(parser: Parser) void {
         log("", .{});
         var buf_copy = [1]u8{0x20} ** step_size;
-        mem.copy(u8, &buf_copy, &parser.input_buf);
-        for (buf_copy) |*c| {
-            if (mem.indexOfScalar(u8, &std.ascii.spaces, c.*) != null) c.* = 0x20;
+        for (buf_copy) |*c, i| {
+            if (mem.indexOfScalar(u8, &std.ascii.spaces, parser.input_buf[i]) == null)
+                c.* = parser.input_buf[i];
         }
         parser.block.dump();
-        log("0123456789" ** 7, .{});
-        log("{s}", .{&buf_copy});
+        log(("0123456789" ** 7)[0..step_size], .{});
+        log("{s}: input_buf", .{&buf_copy});
     }
 };
 
@@ -678,7 +672,6 @@ test "nexts" {
     var fbs = std.io.fixedBufferStream(text);
     var reader = fbs.reader();
     var p = try Parser.init(std.heap.page_allocator, reader);
-    p.dump();
     try expectNext(&p, reader, .{ .char = '{' });
     try expectNext(&p, reader, .{ .char = '"' });
     try expectNext(&p, reader, .{ .string = "asdf" });
@@ -748,20 +741,18 @@ test "basic" {
         n: f64,
         o: *u8,
 
-        pub const __parser = struct {
-            pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
-                _ = reader;
-                _ = try p.nextToken(reader, p.token_buf.len);
-                return 55;
-            }
-        };
+        pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
+            _ = reader;
+            _ = try p.nextToken(reader, p.token_buf.len);
+            return 55;
+        }
     };
     const input =
         \\ { "a" : 42 ,
         \\ "b" : "string",
         \\ "c" : true,
         \\ "d":false,
-        \\ "e":null,
+        \\ "e": null,
         \\ "f":42,
         \\ "g":-42,
         \\ "h":42.2,

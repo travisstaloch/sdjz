@@ -58,11 +58,17 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                         inline for (std.meta.fields(T)) |field| {
                             if (std.mem.eql(u8, key, field.name)) {
                                 log("found key {s}", .{key});
-                                @field(result, field.name) =
-                                    if (@hasDecl(T, "on_" ++ field.name))
-                                    try @field(T, "on_" ++ field.name)(reader, options.allocator, parser)
-                                else
-                                    try parseImpl(field.field_type, parser, reader, options);
+                                if (field.is_comptime) {
+                                    const val = try parseImpl(field.field_type, parser, reader, options);
+                                    if (!std.meta.eql(val, field.default_value.?))
+                                        return error.UnexpectedValue;
+                                } else {
+                                    @field(result, field.name) =
+                                        if (@hasDecl(T, "on_" ++ field.name))
+                                        try @field(T, "on_" ++ field.name)(reader, options.allocator, parser)
+                                    else
+                                        try parseImpl(field.field_type, parser, reader, options);
+                                }
                                 break;
                             }
                         } else {
@@ -105,13 +111,14 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             },
             .One => {
                 var result = try options.allocator.create(tinfo.Pointer.child);
+                errdefer options.allocator.destroy(result);
                 result.* = try parseImpl(tinfo.Pointer.child, parser, reader, options);
                 return result;
             },
             else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer size: {s}", .{@tagName(tinfo.Pointer.size)})),
         },
-        .Int => return parser.readInt(T, reader),
-        .Float => return parser.readFloat(T, reader),
+        .Int, .ComptimeInt => return parser.readInt(T, reader),
+        .Float, .ComptimeFloat => return parser.readFloat(T, reader),
         .Bool => {
             try parser.skipWs(reader);
             const buf = try parser.nextToken(reader, 4);
@@ -139,6 +146,24 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 break :blk try parseImpl(tinfo.Optional.child, parser, reader, options);
             };
         },
+        .Enum => {
+            try parser.skipWs(reader);
+            switch (parser.input_buf[parser.index]) {
+                '0'...'9', '-' => {
+                    const tok = try parser.nextToken(reader, parser.token_buf.len);
+                    const n = try std.fmt.parseInt(tinfo.Enum.tag_type, tok, 10);
+                    return try std.meta.intToEnum(T, n);
+                },
+                '"' => {
+                    try parser.incIndex(reader);
+                    const str = try parser.readString(reader);
+                    return std.meta.stringToEnum(T, str) orelse return error.InvalidEnumTag;
+                },
+                else => return error.InvalidEnumToken,
+            }
+        },
+        // TODO: .Union => {},
+        // TODO: .Array => {},
         else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
     }
 }
@@ -367,6 +392,11 @@ pub const Parser = struct {
         // log("skipWs new index {}", .{parser.index});
     }
 
+    fn incIndex(parser: *Parser, reader: anytype) !void {
+        if (@addWithOverflow(I, parser.index, 1, &parser.index))
+            parser.block = try parser.nextBlock(reader);
+    }
+
     /// assumes parser.index is one past leading '"'
     fn readString(parser: *Parser, reader: anytype) ![]const u8 {
         parser.string_buf.items.len = 0;
@@ -382,8 +412,7 @@ pub const Parser = struct {
             parser.block = try parser.nextBlock(reader);
         }
         // skip trailing '"'
-        if (@addWithOverflow(I, parser.index, 1, &parser.index))
-            parser.block = try parser.nextBlock(reader);
+        try parser.incIndex(reader);
 
         return parser.string_buf.items;
     }
@@ -391,6 +420,7 @@ pub const Parser = struct {
     /// assumes parser.index is one past a leading '"'
     fn readStringAlloc(parser: *Parser, reader: anytype, options: Options) ![]u8 {
         var list = std.ArrayListUnmanaged(u8){};
+        errdefer list.deinit(options.allocator);
         while (true) {
             const start = parser.index;
             const new_index = @ctz(u64, parser.block.string.quote >> parser.index << parser.index);
@@ -403,8 +433,7 @@ pub const Parser = struct {
             parser.block = try parser.nextBlock(reader);
         }
         // skip trailing '"'
-        if (@addWithOverflow(I, parser.index, 1, &parser.index))
-            parser.block = try parser.nextBlock(reader);
+        try parser.incIndex(reader);
 
         return list.toOwnedSlice(options.allocator);
     }
@@ -420,8 +449,7 @@ pub const Parser = struct {
             parser.block = try parser.nextBlock(reader);
         }
         // skip trailing '"'
-        if (@addWithOverflow(I, parser.index, 1, &parser.index))
-            parser.block = try parser.nextBlock(reader);
+        try parser.incIndex(reader);
     }
 
     fn readInt(parser: *Parser, comptime T: type, reader: anytype) !T {
@@ -438,9 +466,10 @@ pub const Parser = struct {
 
     /// assumes parser.index is one past '['
     pub fn readArrayAlloc(parser: *Parser, comptime T: type, reader: anytype, options: Options) ![]T {
-        var list = std.ArrayList(T).init(parser.allocator);
+        var list = std.ArrayListUnmanaged(T){};
+        errdefer list.deinit(options.allocator);
         while (true) {
-            try list.append(try parseImpl(T, parser, reader, options));
+            try list.append(options.allocator, try parseImpl(T, parser, reader, options));
             const next_char = parser.nextChar(reader) catch |err| switch (err) {
                 error.EndOfStream => return error.UnterminatedArray,
                 else => return err,
@@ -451,7 +480,7 @@ pub const Parser = struct {
                 else => return error.InvalidArray,
             }
         }
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(options.allocator);
     }
 
     inline fn find_escaped(parser: *Parser, backslash_: u64) u64 {
@@ -723,6 +752,7 @@ test "twitter.json" {
 
 test "basic" {
     // testing.log_level = .debug;
+    const E = enum { a, b };
     const T = struct {
         a: u8,
         b: []const u8,
@@ -740,6 +770,8 @@ test "basic" {
         m: u128,
         n: f64,
         o: *u8,
+        p: E,
+        q: E,
 
         pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
             _ = reader;
@@ -764,6 +796,8 @@ test "basic" {
         \\ "n": 1.7976931348623157e+308,
         \\"custom":66,
         \\ "o": 101,
+        \\ "p": 0,
+        \\ "q": "a",
         \\}
     ;
     var fbs = std.io.fixedBufferStream(input);
@@ -785,6 +819,8 @@ test "basic" {
     try testing.expectEqual(@as(u8, 55), result.custom);
     try testing.expectEqual(@as(u128, std.math.maxInt(u128)), result.m);
     try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.n, std.math.epsilon(f64));
+    try testing.expectEqual(E.a, result.p);
+    try testing.expectEqual(E.a, result.q);
 }
 
 test "unknown field" {
@@ -797,6 +833,50 @@ test "unknown field" {
         .allocator = std.heap.page_allocator,
         .skip_unknown_fields = false,
     }));
+}
+
+test "comptime fields" {
+    {
+        const input =
+            \\{"a":1}
+        ;
+        const T = struct {
+            comptime a: u8 = 44,
+        };
+        var fbs = std.io.fixedBufferStream(input);
+        try testing.expectError(error.UnexpectedValue, parse(T, fbs.reader(), .{
+            .allocator = std.heap.page_allocator,
+            .skip_unknown_fields = false,
+        }));
+    }
+    {
+        const input =
+            \\{"b": 2.2}
+        ;
+        const T = struct {
+            comptime b: f32 = 1.1,
+        };
+        var fbs = std.io.fixedBufferStream(input);
+        try testing.expectError(error.UnexpectedValue, parse(T, fbs.reader(), .{
+            .allocator = std.heap.page_allocator,
+            .skip_unknown_fields = false,
+        }));
+    }
+    {
+        const input =
+            \\{"a": 44, "b": 1.1}
+        ;
+        const T = struct {
+            comptime a: u8 = 44,
+            comptime b: f32 = 1.1,
+        };
+        var fbs = std.io.fixedBufferStream(input);
+        _ = try parse(T, fbs.reader(), .{
+            .allocator = std.heap.page_allocator,
+            .skip_unknown_fields = false,
+        });
+        // don't need to verify field values, just make sure the fields are found
+    }
 }
 
 // pub const log_level = .debug;

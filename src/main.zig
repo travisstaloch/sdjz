@@ -168,9 +168,8 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 '[' => {
                     try parser.incIndex(reader);
                     var result: T = undefined;
-                    // TODO errdefer free
+                    // TODO errdefer free i results
                     var i: usize = 0;
-
                     while (i < result.len) : (i += 1) {
                         if (i > 0) try parser.expectChar(',', reader);
                         result[i] = try parseImpl(tinfo.Array.child, parser, reader, options);
@@ -194,7 +193,26 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             }
             unreachable;
         },
-        // TODO: .Union => {},
+        .Union => {
+            try parser.expectChar('{', reader);
+            try parser.skipWs(reader);
+            try parser.expectChar('"', reader);
+            const key = parser.readString(reader) catch |err| switch (err) {
+                error.EndOfStream => return error.InvalidUnionObject,
+                else => return err,
+            };
+            log("union key {s}", .{key});
+            try parser.expectChar(':', reader);
+            inline for (std.meta.fields(T)) |field| {
+                if (std.mem.eql(u8, key, field.name)) {
+                    var result = @unionInit(T, field.name, try parseImpl(field.field_type, parser, reader, options));
+                    // TODO: errdefer parseFree(result);
+                    try parser.expectChar('}', reader);
+                    return result;
+                }
+            }
+            return error.NoUnionMembersMatched;
+        },
         else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
     }
 }
@@ -786,25 +804,27 @@ test "basic" {
     const E = enum { a, b };
     const T = struct {
         a: u8,
-        b: []const u8,
+        b: []const u8, // string
         c: bool,
         d: bool,
-        e: ?u8,
+        e: ?u8, // optional
         f: ?u8,
         g: ?i8,
         h: ?f32,
-        i: f32,
-        j: []u8,
+        i: f32, // float
+        j: []u8, // slice from array
         k: struct { a: u8 },
-        l: []usize,
-        custom: u8,
+        l: []usize, // non u8 slice
+        custom: u8, // using on_custom method
         m: u128,
         n: f64,
-        o: *u8,
-        p: E,
+        o: *u8, // pointer to one
+        p: E, // enum
         q: E,
-        r: [2]u8,
+        r: [2]u8, // array
         s: [2]u8,
+        t: union { a: usize, b: []const u8 }, // bare union
+        u: union(enum) { a: usize, b: []const u8 }, // union(enum)
 
         pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
             _ = reader;
@@ -833,6 +853,8 @@ test "basic" {
         \\ "q": "a",
         \\ "r": [1,2],
         \\ "s": "ab",
+        \\ "t": {"a": 42},
+        \\ "u": {"b": "bstr"},
         \\}
     ;
     var fbs = std.io.fixedBufferStream(input);
@@ -858,6 +880,8 @@ test "basic" {
     try testing.expectEqual(E.a, result.q);
     try testing.expectEqual([_]u8{ 1, 2 }, result.r);
     try testing.expectEqualStrings("ab", &result.s);
+    try testing.expectEqual(@as(usize, 42), result.t.a);
+    try testing.expectEqualStrings("bstr", result.u.b);
 }
 
 test "unknown field" {

@@ -16,7 +16,7 @@ pub fn build(b: *std.build.Builder) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);
 
-    const exe = b.addExecutable("simdjson-zig", "src/simdjson.zig");
+    const exe = b.addExecutable("simdjson-zig", "src/main.zig");
     exe.setBuildMode(mode);
     exe.install();
     exe.linkLibC();

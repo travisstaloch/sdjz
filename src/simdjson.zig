@@ -6,8 +6,7 @@ const u8x64 = std.meta.Vector(64, u8);
 const u8x32 = std.meta.Vector(32, u8);
 const u64x2 = std.meta.Vector(2, u64);
 const step_size = 64;
-const I = std.meta.Int(.unsigned, std.math.log2_int(u8, step_size));
-const debug = true;
+const Log2StepSizeInt = std.meta.Int(.unsigned, std.math.log2_int(u8, step_size));
 
 pub const Options = struct {
     /// allocator to use when pointer or slice fields are found
@@ -18,17 +17,17 @@ pub const Options = struct {
     skip_unknown_fields: bool = true,
 };
 
+/// helper around `parseUnbuffered` with a `std.io.bufferedReader(reader)`.
 /// if T includes methods such as `on_field` 
 /// with the following signature, they will be called when `field` is found: 
 ///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
 /// the return type Ret must coerce to the type of `field`.
-/// helper around `parseUnbuffered` with a `std.io.bufferedReader(reader)`.
 pub fn parse(comptime T: type, reader: anytype, options: Options) !T {
     var buffered_reader = std.io.bufferedReader(reader);
     return parseUnbuffered(T, &buffered_reader, options);
 }
 
-/// same as `parse` but with no buffered reader
+/// same as `parse` but doesn't make a buffered reader from `reader`
 pub fn parseUnbuffered(comptime T: type, reader: anytype, options: Options) !T {
     var p = try parser(options.allocator, reader);
     defer p.deinit();
@@ -138,7 +137,7 @@ pub fn Parser(comptime Reader: type) type {
         prev_in_string: u64 = 0,
         block: Block,
         /// the current index within input_buf
-        index: I = 0,
+        index: Log2StepSizeInt = 0,
         input_buf: [step_size]u8 = undefined,
         /// temporary buffer for keys and string values
         string_buf: std.ArrayListUnmanaged(u8) = .{},
@@ -213,7 +212,7 @@ pub fn Parser(comptime Reader: type) type {
             return result;
         }
 
-        fn nextBlock(self: *Self) !Block {
+        pub fn nextBlock(self: *Self) !Block {
             self.input_buf = [1]u8{0x20} ** step_size;
             self.index = 0;
             const n = try self.reader.read(&self.input_buf);
@@ -242,7 +241,7 @@ pub fn Parser(comptime Reader: type) type {
             };
         }
 
-        fn nextChar(self: *Self) !u8 {
+        pub fn nextChar(self: *Self) !u8 {
             if (self.last_char) |lc| {
                 log("nextChar() using last_char '{c}'", .{lc});
                 defer self.last_char = null;
@@ -259,7 +258,7 @@ pub fn Parser(comptime Reader: type) type {
                 );
                 log("nextChar() index2 {}", .{index});
                 if (index < step_size) {
-                    const new_index = @truncate(I, index);
+                    const new_index = @truncate(Log2StepSizeInt, index);
                     const result = self.input_buf[new_index];
                     log("nextChar result '{c}'", .{result});
                     if (new_index == step_size - 1) {
@@ -272,7 +271,7 @@ pub fn Parser(comptime Reader: type) type {
             unreachable;
         }
 
-        fn nextToken(self: *Self, comptime max_len: u32) ![]const u8 {
+        pub fn nextToken(self: *Self, comptime max_len: u32) ![]const u8 {
             log("nextToken index {}", .{self.index});
             try self.skipWs();
             // log("nextToken after skipWs index {}", .{self.index});
@@ -299,15 +298,15 @@ pub fn Parser(comptime Reader: type) type {
                 else
                     return error.TokenTooLong;
                 mem.copy(u8, self.token_buf[token_len..], slice2);
-                self.index = @truncate(I, token_len2);
+                self.index = @truncate(Log2StepSizeInt, token_len2);
                 return self.token_buf[0..std.math.min(token_len + token_len2, max_len)];
             };
             log("nextToken slice '{s}'", .{slice});
-            self.index += @truncate(I, slice.len);
+            self.index += @truncate(Log2StepSizeInt, slice.len);
             return slice;
         }
 
-        fn expectChar(self: *Self, comptime expected: u8) !void {
+        pub fn expectChar(self: *Self, comptime expected: u8) !void {
             log("expectChar('{c}')", .{expected});
             const actual = try self.nextChar();
             if (expected != actual) {
@@ -316,23 +315,23 @@ pub fn Parser(comptime Reader: type) type {
             }
         }
 
-        fn skipWs(self: *Self) !void {
+        pub fn skipWs(self: *Self) !void {
             const mask = @as(u64, 1) << self.index;
             // log("{b:0>64}: mask", .{@bitReverse(u64, mask)});
             // log("{b:0>64}: self.block.characters.whitespace", .{@bitReverse(u64, self.block.characters.whitespace)});
 
             const is_next_ws = @boolToInt(mask & self.block.characters.whitespace != 0);
-            self.index += is_next_ws * try std.math.cast(I, @ctz(u64, ~self.block.characters.whitespace >> self.index));
+            self.index += is_next_ws * try std.math.cast(Log2StepSizeInt, @ctz(u64, ~self.block.characters.whitespace >> self.index));
             // log("skipWs new index {}", .{self.index});
         }
 
-        fn incIndex(self: *Self) !void {
-            if (@addWithOverflow(I, self.index, 1, &self.index))
+        pub fn incIndex(self: *Self) !void {
+            if (@addWithOverflow(Log2StepSizeInt, self.index, 1, &self.index))
                 self.block = try self.nextBlock();
         }
 
         /// assumes self.index is one past leading '"'
-        fn readString(self: *Self) ![]const u8 {
+        pub fn readString(self: *Self) ![]const u8 {
             self.string_buf.items.len = 0;
             while (true) {
                 const start = self.index;
@@ -340,7 +339,7 @@ pub fn Parser(comptime Reader: type) type {
                 try self.string_buf.appendSlice(self.allocator, self.input_buf[start..new_index]);
                 log("readString start {} new_index {} string_buf '{s}'", .{ start, new_index, self.string_buf.items });
                 if (new_index < step_size) {
-                    self.index = @truncate(I, new_index);
+                    self.index = @truncate(Log2StepSizeInt, new_index);
                     break;
                 }
                 self.block = try self.nextBlock();
@@ -352,7 +351,7 @@ pub fn Parser(comptime Reader: type) type {
         }
 
         /// assumes self.index is one past a leading '"'
-        fn readStringAlloc(self: *Self, options: Options) ![]u8 {
+        pub fn readStringAlloc(self: *Self, options: Options) ![]u8 {
             var list = std.ArrayListUnmanaged(u8){};
             errdefer {
                 while (list.popOrNull()) |v|
@@ -366,7 +365,7 @@ pub fn Parser(comptime Reader: type) type {
                 try list.appendSlice(options.allocator, self.input_buf[start..new_index]);
                 log("readStringAlloc start {} new_index {} string_buf '{s}'", .{ start, new_index, self.string_buf.items });
                 if (new_index < step_size) {
-                    self.index = @truncate(I, new_index);
+                    self.index = @truncate(Log2StepSizeInt, new_index);
                     break;
                 }
                 self.block = try self.nextBlock();
@@ -378,11 +377,11 @@ pub fn Parser(comptime Reader: type) type {
         }
 
         /// assumes self.index is one past a leading '"'
-        fn skipString(self: *Self) !void {
+        pub fn skipString(self: *Self) !void {
             while (true) {
                 const new_index = @ctz(u64, self.block.string.quote >> self.index << self.index);
                 if (new_index < step_size) {
-                    self.index = @truncate(I, new_index);
+                    self.index = @truncate(Log2StepSizeInt, new_index);
                     break;
                 }
                 self.block = try self.nextBlock();
@@ -391,20 +390,20 @@ pub fn Parser(comptime Reader: type) type {
             try self.incIndex();
         }
 
-        fn readInt(self: *Self, comptime T: type) !T {
+        pub fn readInt(self: *Self, comptime T: type) !T {
             try self.skipWs();
             const tok = try self.nextToken(self.token_buf.len);
             return try std.fmt.parseInt(T, tok, 10);
         }
 
-        fn readFloat(self: *Self, comptime T: type) !T {
+        pub fn readFloat(self: *Self, comptime T: type) !T {
             try self.skipWs();
             const tok = try self.nextToken(self.token_buf.len);
             return try std.fmt.parseFloat(T, tok);
         }
 
         /// assumes self.index is one past '['
-        fn readArrayAlloc(self: *Self, comptime T: type, options: Options) ![]T {
+        pub fn readArrayAlloc(self: *Self, comptime T: type, options: Options) ![]T {
             var list = std.ArrayListUnmanaged(T){};
             errdefer list.deinit(options.allocator);
             while (true) {
@@ -444,7 +443,7 @@ pub fn Parser(comptime Reader: type) type {
         fn nextStructuralIndex(self: *Self) u7 {
             return @ctz(u64, self.block.characters.op);
         }
-        fn skipValue(self: *Self) !void {
+        pub fn skipValue(self: *Self) !void {
             const Container = enum { arr, obj };
             var containers: [256]Container = undefined;
             var depth: u8 = 0;
@@ -487,7 +486,7 @@ pub fn Parser(comptime Reader: type) type {
             }
         }
 
-        fn dump(self: Self) void {
+        pub fn dump(self: Self) void {
             log("", .{});
             var buf_copy = [1]u8{0x20} ** step_size;
             for (buf_copy) |*c, i| {
@@ -813,215 +812,6 @@ const Block = struct {
         log("{b:0>64}: follows_nonquote_scalar", .{@bitReverse(u64, block.follows_nonquote_scalar)});
     }
 };
-
-const testing = std.testing;
-
-const Expected = union(enum) {
-    char: u8,
-    string: []const u8,
-    token: []const u8,
-};
-
-fn expectNext(p: anytype, expected: Expected) !void {
-    switch (expected) {
-        .char => {
-            const c = try p.nextChar();
-            try testing.expectEqual(expected.char, c);
-        },
-        .string => {
-            const s = try p.readString();
-            try testing.expectEqualStrings(expected.string, s);
-        },
-        .token => {
-            const s = try p.nextToken(std.math.maxInt(u32));
-            try testing.expectEqualStrings(expected.token, s);
-        },
-    }
-}
-
-test "nexts" {
-    // testing.log_level = .debug;
-    const text =
-        \\  {"asdf" : false,"bsdf":null }
-    ;
-    var fbs = std.io.fixedBufferStream(text);
-    var p = try parser(testing.allocator, &fbs.reader());
-    defer p.deinit();
-    try expectNext(&p, .{ .char = '{' });
-    try expectNext(&p, .{ .char = '"' });
-    try expectNext(&p, .{ .string = "asdf" });
-    try expectNext(&p, .{ .char = ':' });
-    try expectNext(&p, .{ .token = "false" });
-    try expectNext(&p, .{ .char = ',' });
-    try expectNext(&p, .{ .char = '"' });
-    try expectNext(&p, .{ .string = "bsdf" });
-    try expectNext(&p, .{ .char = ':' });
-    try expectNext(&p, .{ .token = "null" });
-    try expectNext(&p, .{ .char = '}' });
-}
-
-test "span multiple blocks" {
-    // testing.log_level = .debug;
-    const input =
-        //0123456789012345678901234567890123456789012345678901234567890123
-        \\{                 "l":[100000,200000,3000000,18446744073709551615]}
-        //                                                               ^ block ends here
-    ;
-    var fbs = std.io.fixedBufferStream(input);
-    var p = try parser(testing.allocator, &fbs.reader());
-    try testing.expectEqual(@as(usize, 64), p.input_buf.len);
-    try testing.expectEqual(@as(usize, 67), input.len);
-    try testing.expectEqual(@as(u8, '1'), input[63]);
-    const T = struct { l: []const usize };
-    const options: Options = .{ .allocator = testing.allocator };
-    const result = try parseText(T, input, options);
-    defer parseFree(T, result, options);
-    try testing.expectEqual(@as(usize, 4), result.l.len);
-    try testing.expectEqual(@as(usize, 18446744073709551615), result.l[3]);
-}
-
-test "twitter.json" {
-    // testing.log_level = .debug;
-    const f = try std.fs.cwd().openFile("testdata/twitter.json", .{ .read = true });
-    defer f.close();
-
-    const Status = struct { id: usize };
-    const Twitter = struct { statuses: []const Status };
-    const result = try parse(Twitter, f.reader(), .{ .allocator = testing.allocator });
-    defer parseFree(Twitter, result, .{ .allocator = testing.allocator });
-    try testing.expectEqual(@as(usize, 1), result.statuses.len);
-    try testing.expectEqual(@as(usize, 505874924095815681), result.statuses[0].id);
-}
-
-test "basic" {
-    @setEvalBranchQuota(3000);
-    // testing.log_level = .debug;
-    const E = enum { a, b };
-    const T = struct {
-        num: u8,
-        str: []const u8,
-        bool1: bool,
-        bool2: bool,
-        opt_null: ?u8,
-        opt_42: ?u8,
-        opt_neg42: ?i8,
-        opt_float422: ?f32,
-        float422: f32,
-        slice_arr: []u8,
-        nested_struct: struct { a: u8 },
-        slice_nonu8: []usize,
-        custom: u8, // uses on_custom method
-        num_large: u128,
-        float_large: f64,
-        ptr_one: *u8,
-        enum1: E,
-        enum2: E,
-        arr1: [2]u8,
-        arr2: [2]u8,
-        union_bare: union { a: usize, b: []const u8 },
-        union_enum: union(enum) { a: usize, b: []const u8 },
-        default_missing: u8 = 66,
-
-        pub fn on_custom(_: *mem.Allocator, p: anytype) !u7 {
-            _ = try p.nextToken(p.token_buf.len);
-            return 55;
-        }
-    };
-    const input =
-        \\ { "num" : 42 ,
-        \\ "str" : "string",
-        \\ "bool1" : true,
-        \\ "bool2":false,
-        \\ "opt_null": null,
-        \\ "opt_42":42,
-        \\ "opt_neg42":-42,
-        \\ "opt_float422":42.2,
-        \\ "float422":42.2,
-        \\ "slice_arr": [ 1 , 2 , 3 ] , 
-        \\ "nested_struct":{"a":42},
-        \\ "slice_nonu8":[10000,200000,3000000,18446744073709551615],
-        \\ "num_large": 340282366920938463463374607431768211455,
-        \\ "float_large": 1.7976931348623157e+308,
-        \\"custom":66,
-        \\ "ptr_one": 101,
-        \\ "enum1": 0,
-        \\ "enum2": "b",
-        \\ "arr1": [1,2],
-        \\ "arr2": "ab",
-        \\ "union_bare": {"a": 42},
-        \\ "union_enum": {"b": "bstr"},
-        \\}
-    ;
-    const options = Options{ .allocator = testing.allocator };
-    const result = try parseText(T, input, options);
-    defer parseFree(T, result, options);
-
-    try testing.expectEqual(@as(u8, 42), result.num);
-    try testing.expectEqualStrings("string", result.str);
-    try testing.expect(result.bool1);
-    try testing.expect(!result.bool2);
-    try testing.expect(result.opt_null == null);
-    try testing.expectEqual(@as(?u8, 42), result.opt_42);
-    try testing.expectEqual(@as(?i8, -42), result.opt_neg42);
-    try testing.expect(result.opt_float422 != null);
-    try testing.expectApproxEqAbs(@as(f32, 42.2), result.opt_float422.?, std.math.epsilon(f32));
-    try testing.expectApproxEqAbs(@as(f32, 42.2), result.float422, std.math.epsilon(f32));
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, result.slice_arr);
-    try testing.expectEqual(@as(u8, 42), result.nested_struct.a);
-    try testing.expectEqualSlices(usize, &[_]usize{ 10_000, 200_000, 3_000_000, std.math.maxInt(usize) }, result.slice_nonu8);
-    try testing.expectEqual(@as(u8, 55), result.custom);
-    try testing.expectEqual(@as(u128, std.math.maxInt(u128)), result.num_large);
-    try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.float_large, std.math.epsilon(f64));
-    try testing.expectEqual(E.a, result.enum1);
-    try testing.expectEqual(E.b, result.enum2);
-    try testing.expectEqual([_]u8{ 1, 2 }, result.arr1);
-    try testing.expectEqualStrings("ab", &result.arr2);
-    try testing.expectEqual(@as(usize, 42), result.union_bare.a);
-    try testing.expect(result.union_enum == .b);
-    try testing.expectEqualStrings("bstr", result.union_enum.b);
-    try testing.expectEqual(@as(u8, 66), result.default_missing);
-}
-
-test "unknown field" {
-    const T = struct { b: u8 };
-    try testing.expectError(error.UnknownField, parseText(T,
-        \\{"a":1}
-    , .{ .allocator = testing.allocator, .skip_unknown_fields = false }));
-}
-
-test "comptime fields" {
-    {
-        const T = struct { comptime a: u8 = 44 };
-        try testing.expectError(error.UnexpectedValue, parseText(T,
-            \\{"a":1}
-        , .{
-            .allocator = testing.allocator,
-            .skip_unknown_fields = false,
-        }));
-    }
-    {
-        const T = struct { comptime b: f32 = 1.1 };
-        try testing.expectError(error.UnexpectedValue, parseText(T,
-            \\{"b": 2.2}
-        , .{
-            .allocator = testing.allocator,
-            .skip_unknown_fields = false,
-        }));
-    }
-    {
-        const T = struct {
-            comptime a: u8 = 44,
-            comptime b: f32 = 1.1,
-        };
-        _ = try parseText(T,
-            \\{"a": 44, "b": 1.1}
-        , .{
-            .allocator = testing.allocator,
-            .skip_unknown_fields = false,
-        });
-        // don't need to verify field values, just make sure the fields are found
-    }
-}
 
 // pub const log_level = .debug;
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};

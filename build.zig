@@ -9,14 +9,14 @@ pub fn build(b: *std.build.Builder) void {
     // lib.setBuildMode(mode);
     // lib.install();
 
-    var main_tests = b.addTest("src/main.zig");
+    var main_tests = b.addTest("src/tests.zig");
     main_tests.setBuildMode(mode);
     main_tests.linkLibC();
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);
 
-    const exe = b.addExecutable("simdjson-zig", "src/main.zig");
+    const exe = b.addExecutable("simdjson-zig", "src/simdjson.zig");
     exe.setBuildMode(mode);
     exe.install();
     exe.linkLibC();

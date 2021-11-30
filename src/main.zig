@@ -21,220 +21,24 @@ pub const Options = struct {
 /// if T includes methods such as `on_field` 
 /// with the following signature, they will be called when `field` is found: 
 ///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
-/// The return type Ret must match the type of `field`.
+/// the return type Ret must coerce to the type of `field`.
+/// helper around `parseUnbuffered` with a `std.io.bufferedReader(reader)`.
 pub fn parse(comptime T: type, reader: anytype, options: Options) !T {
     var buffered_reader = std.io.bufferedReader(reader);
-    var parser = try Parser.init(options.allocator, &buffered_reader);
-    defer parser.deinit();
-    return parseImpl(T, &parser, &buffered_reader, options);
+    return parseUnbuffered(T, &buffered_reader, options);
 }
 
-fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Options) !T {
-    log("-- parseImpl {s}", .{@typeName(T)});
-    defer log("-- done parseImpl {s}", .{@typeName(T)});
-    const R = @TypeOf(reader);
-    if (@typeInfo(R) != .Pointer)
-        @compileError(comptime std.fmt.comptimePrint("reader must be a pointer. found type '{s}'", .{@typeName(R)}));
-    const tinfo = @typeInfo(T);
-    switch (tinfo) {
-        .Struct => |structInfo| {
-            try parser.expectChar('{', reader);
-            var result: T = undefined;
-            var fields_seen = [_]bool{false} ** structInfo.fields.len;
-            errdefer {
-                inline for (structInfo.fields) |field, i| {
-                    if (fields_seen[i] and !field.is_comptime)
-                        parseFree(field.field_type, @field(result, field.name), options);
-                }
-            }
+/// same as `parse` but with no buffered reader
+pub fn parseUnbuffered(comptime T: type, reader: anytype, options: Options) !T {
+    var p = try parser(options.allocator, reader);
+    defer p.deinit();
+    return p.parseImpl(T, options);
+}
 
-            while (true) {
-                const next_char = parser.nextChar(reader) catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return err,
-                };
-                log("parseImpl next_char '{c}'", .{next_char});
-                switch (next_char) {
-                    '"' => {
-                        const key = parser.readString(reader) catch |err| switch (err) {
-                            error.EndOfStream => break,
-                            else => return err,
-                        };
-                        log("key {s}", .{key});
-                        try parser.expectChar(':', reader);
-                        inline for (structInfo.fields) |field, i| {
-                            if (std.mem.eql(u8, key, field.name)) {
-                                log("found key {s}", .{key});
-                                if (field.is_comptime) {
-                                    const val = try parseImpl(field.field_type, parser, reader, options);
-                                    if (!std.meta.eql(val, field.default_value.?))
-                                        return error.UnexpectedValue;
-                                } else {
-                                    @field(result, field.name) =
-                                        if (@hasDecl(T, "on_" ++ field.name))
-                                        try @field(T, "on_" ++ field.name)(reader, options.allocator, parser)
-                                    else
-                                        try parseImpl(field.field_type, parser, reader, options);
-                                }
-                                fields_seen[i] = true;
-                                break;
-                            }
-                        } else {
-                            if (options.skip_unknown_fields) {
-                                try parser.skipValue(reader);
-                                continue;
-                            } else return error.UnknownField;
-                        }
-                    },
-                    ',' => {}, // TODO: don't allow trailing comma
-                    ']' => {
-                        parser.last_char = next_char;
-                        return result;
-                    },
-                    '}' => {
-                        parser.last_char = next_char;
-                        break;
-                    },
-                    else => return error.InvalidCharacter,
-                }
-            } // end while(true)
-            try parser.expectChar('}', reader);
-            inline for (structInfo.fields) |field, i| {
-                if (!fields_seen[i]) {
-                    if (field.default_value) |default| {
-                        if (!field.is_comptime)
-                            @field(result, field.name) = default;
-                    } else return error.MissingField;
-                }
-            }
-            return result;
-        },
-        .Pointer => |ptrInfo| switch (ptrInfo.size) {
-            .Slice => {
-                const next_char = try parser.nextChar(reader);
-                switch (next_char) {
-                    '"' => {
-                        if (ptrInfo.child == u8) {
-                            return try parser.readStringAlloc(reader, options);
-                        } else return error.UnsupportedStringType;
-                    },
-                    '[' => {
-                        const result = try parser.readArrayAlloc(ptrInfo.child, reader, options);
-                        return result;
-                    },
-                    else => return error.InvalidToken,
-                }
-            },
-            .One => {
-                var result = try options.allocator.create(ptrInfo.child);
-                errdefer options.allocator.destroy(result);
-                result.* = try parseImpl(ptrInfo.child, parser, reader, options);
-                return result;
-            },
-            else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer size: {s}", .{@tagName(tinfo.Pointer.size)})),
-        },
-        .Int, .ComptimeInt => return parser.readInt(T, reader),
-        .Float, .ComptimeFloat => return parser.readFloat(T, reader),
-        .Bool => {
-            try parser.skipWs(reader);
-            const buf = try parser.nextToken(reader, 4);
-
-            log(".Bool '{s}' next '{c}' ", .{ buf, parser.input_buf[parser.index -| 1] });
-            const i = std.mem.readIntSliceLittle(u32, buf);
-            return switch (i) {
-                std.mem.readIntLittle(u32, "true") => true,
-                std.mem.readIntLittle(u32, "fals") => if (parser.input_buf[parser.index -| 1] == 'e') blk: {
-                    parser.index += 1;
-                    break :blk false;
-                } else error.InvalidBool,
-                else => error.InvalidBool,
-            };
-        },
-        .Optional => |optInfo| {
-            try parser.skipWs(reader);
-            const next_char = parser.input_buf[parser.index];
-            return if (next_char == 'n') blk: {
-                const tok = try parser.nextToken(reader, 4);
-                const i = std.mem.readIntLittle(u32, tok[0..4]);
-                // log("buf '{s}' i {} - {}", .{ &buf, i, std.mem.readIntLittle(u24, "ull") });
-                break :blk if (i == std.mem.readIntLittle(u32, "null")) @as(T, null) else error.InvalidOptional;
-            } else blk: {
-                break :blk try parseImpl(optInfo.child, parser, reader, options);
-            };
-        },
-        .Enum => |enumInfo| {
-            try parser.skipWs(reader);
-            switch (parser.input_buf[parser.index]) {
-                '0'...'9', '-' => {
-                    const tok = try parser.nextToken(reader, parser.token_buf.len);
-                    const n = try std.fmt.parseInt(enumInfo.tag_type, tok, 10);
-                    return try std.meta.intToEnum(T, n);
-                },
-                '"' => {
-                    try parser.incIndex(reader);
-                    const str = try parser.readString(reader);
-                    return std.meta.stringToEnum(T, str) orelse return error.InvalidEnumTag;
-                },
-                else => return error.InvalidEnumToken,
-            }
-        },
-        .Array => |arrInfo| {
-            try parser.skipWs(reader);
-            switch (parser.input_buf[parser.index]) {
-                '[' => {
-                    try parser.incIndex(reader);
-                    var result: T = undefined;
-                    var i: usize = 0;
-                    errdefer {
-                        if (result.len > 0) while (true) : (i -= 1) {
-                            parseFree(arrInfo.child, result[i], options);
-                            if (i == 0) break;
-                        };
-                    }
-                    while (i < result.len) : (i += 1) {
-                        if (i > 0) try parser.expectChar(',', reader);
-                        result[i] = try parseImpl(arrInfo.child, parser, reader, options);
-                    }
-                    const char = parser.nextChar(reader) catch return error.UnexpectedEndOfJson;
-                    switch (char) {
-                        ']' => {},
-                        else => return error.UnexpectedToken,
-                    }
-                    return result;
-                },
-                '"' => {
-                    if (arrInfo.child != u8) return error.UnexpectedToken;
-                    try parser.incIndex(reader);
-                    var result: T = undefined;
-                    const str = try parser.readString(reader);
-                    mem.copy(u8, &result, str);
-                    return result;
-                },
-                else => return error.UnexpectedToken,
-            }
-            unreachable;
-        },
-        .Union => |unionInfo| {
-            try parser.expectChar('{', reader);
-            try parser.expectChar('"', reader);
-            const key = parser.readString(reader) catch |err| switch (err) {
-                error.EndOfStream => return error.InvalidUnionObject,
-                else => return err,
-            };
-            log("union key {s}", .{key});
-            try parser.expectChar(':', reader);
-            inline for (unionInfo.fields) |field| {
-                if (std.mem.eql(u8, key, field.name)) {
-                    var result = @unionInit(T, field.name, try parseImpl(field.field_type, parser, reader, options));
-                    errdefer parseFree(T, result, options);
-                    try parser.expectChar('}', reader);
-                    return result;
-                }
-            }
-            return error.NoUnionMembersMatched;
-        },
-        else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
-    }
+/// helper around `parse()` via `io.fixedBufferStream(input).reader()`
+pub fn parseText(comptime T: type, input: []const u8, options: Options) !T {
+    var fbs = std.io.fixedBufferStream(input);
+    return try parse(T, fbs.reader(), options);
 }
 
 /// Releases resources created by `parse`.
@@ -251,7 +55,7 @@ pub fn parseFree(comptime T: type, value: T, options: Options) void {
                         break;
                     }
                 }
-            } else unreachable;
+            }
         },
         .Struct => |structInfo| {
             inline for (structInfo.fields) |field| {
@@ -281,6 +85,17 @@ pub fn parseFree(comptime T: type, value: T, options: Options) void {
     }
 }
 
+/// initializes a Parser(Reader) and loads a block
+pub fn parser(allocator: *mem.Allocator, reader: anytype) !Parser(@TypeOf(reader)) {
+    var p: Parser(@TypeOf(reader)) = .{
+        .allocator = allocator,
+        .block = undefined,
+        .reader = reader,
+    };
+    p.block = try p.nextBlock();
+    return p;
+}
+
 const StringBlock = struct {
     backslash: u64,
     escaped: u64,
@@ -305,382 +120,595 @@ const StringBlock = struct {
 };
 
 extern fn @"llvm.x86.pclmulqdq"(u64x2, u64x2, i8) u64x2;
-pub inline fn carrylessMul(a: u64x2, b: u64x2) u64x2 {
+inline fn carrylessMul(a: u64x2, b: u64x2) u64x2 {
     return @bitCast(
         u64x2,
         @"llvm.x86.pclmulqdq"(a, b, 0),
     );
 }
 
-pub const Parser = struct {
-    allocator: *mem.Allocator,
-    prev_escaped: u64 = 0,
-    prev_scalar: u64 = 0,
-    prev_in_string: u64 = 0,
-    block: Block,
-    /// the current index within input_buf
-    index: I = 0,
-    input_buf: [step_size]u8 = undefined,
-    /// temporary buffer for keys and string values
-    string_buf: std.ArrayListUnmanaged(u8) = .{},
-    /// temporary buffer for numbers, true, false and null tokens
-    token_buf: [40]u8 = undefined,
-    /// single character lookbehind
-    last_char: ?u8 = null,
+pub fn Parser(comptime Reader: type) type {
+    if (!std.meta.trait.is(.Pointer)(Reader))
+        @compileError(comptime std.fmt.comptimePrint("reader must be a pointer. found type '{s}'", .{@typeName(Reader)}));
 
-    pub fn init(allocator: *mem.Allocator, reader: anytype) !Parser {
-        var p: Parser = .{
-            .allocator = allocator,
-            .block = undefined,
-        };
-        p.block = try p.nextBlock(reader);
-        return p;
-    }
-    pub fn deinit(p: *Parser) void {
-        p.string_buf.deinit(p.allocator);
-    }
+    return struct {
+        allocator: *mem.Allocator,
+        prev_escaped: u64 = 0,
+        prev_scalar: u64 = 0,
+        prev_in_string: u64 = 0,
+        block: Block,
+        /// the current index within input_buf
+        index: I = 0,
+        input_buf: [step_size]u8 = undefined,
+        /// temporary buffer for keys and string values
+        string_buf: std.ArrayListUnmanaged(u8) = .{},
+        /// temporary buffer for numbers, true, false and null tokens
+        token_buf: [40]u8 = undefined,
+        /// single character lookbehind
+        last_char: ?u8 = null,
+        reader: Reader,
 
-    inline fn nextStringBlock(parser: *Parser, input_vec: u8x64) StringBlock {
-        const backslash_vec = input_vec == @splat(64, @as(u8, '\\'));
-        const backslash = @bitCast(u64, backslash_vec);
-        const escaped = parser.find_escaped(backslash);
-        const quote_vec = input_vec == @splat(64, @as(u8, '"'));
-        const quote = @bitCast(u64, quote_vec) & ~escaped;
-
-        //
-        // prefix_xor flips on bits inside the string (and flips off the end quote).
-        //
-        // Then we xor with prev_in_string: if we were in a string already, its effect is flipped
-        // (characters inside strings are outside, and characters outside strings are inside).
-        //
-        const ones: u64x2 = [1]u64{std.math.maxInt(u64)} ** 2;
-        var in_string = carrylessMul(.{ quote, 0 }, ones)[0];
-        // println("{b:0>64} | quote a", .{@bitReverse(u64, quote)});
-        // println("{b:0>64} | ones[0]", .{@bitReverse(u64, ones[0])});
-        // println("{b:0>64} | in_string a", .{@bitReverse(u64, in_string)});
-        // println("{b:0>64} | prev_in_string a", .{@bitReverse(u64, parser.prev_in_string)});
-        in_string ^= parser.prev_in_string;
-        // println("{b:0>64} | in_string b", .{@bitReverse(u64, in_string)});
-
-        //
-        // Check if we're still in a string at the end of the box so the next block will know
-        //
-        // right shift of a signed value expected to be well-defined and standard
-        // compliant as of C++20, John Regher from Utah U. says this is fine code
-        //
-        // println("{b:0>64} | prev_in_string a", .{@bitReverse(u64, parser.prev_in_string)});
-        // println("{b:0>64} | @bitCast(i64, in_string) ", .{@bitReverse(i64, @bitCast(i64, in_string))});
-        // println("{b:0>64} | @bitCast(i64, in_string) >> 63 ", .{@bitReverse(i64, @bitCast(i64, in_string) >> 63)});
-        // println("{b:0>64} | @bitCast(u64, @bitCast(i64, in_string) >> 63) ", .{@bitReverse(u64, @bitCast(u64, @bitCast(i64, in_string) >> 63))});
-        parser.prev_in_string = @bitCast(u64, @bitCast(i64, in_string) >> 63);
-
-        // Use ^ to turn the beginning quote off, and the end quote on.
-
-        // We are returning a function-local object so either we get a move constructor
-        // or we get copy elision.
-        return StringBlock{
-            .backslash = backslash,
-            .escaped = escaped,
-            .quote = quote,
-            .in_string = in_string,
-        };
-    }
-
-    inline fn follows(match: u64, overflow: *u64) u64 {
-        const result = match << 1 | overflow.*;
-        overflow.* = match >> 63;
-        return result;
-    }
-
-    fn nextBlock(parser: *Parser, reader: anytype) !Block {
-        parser.input_buf = [1]u8{0x20} ** step_size;
-        parser.index = 0;
-        const n = try reader.read(&parser.input_buf);
-        if (n == 0) return error.EndOfStream;
-        const string = parser.nextStringBlock(parser.input_buf);
-        // identifies the white-space and the structurat characters
-        const characters = CharacterBlock.classify(parser.input_buf);
-
-        // The term "scalar" refers to anything except structural characters and white space
-        // (so letters, numbers, quotes).
-        // We want  follows_scalar to mark anything that follows a non-quote scalar (so letters and numbers).
-        //
-        // A terminal quote should either be followed by a structural character (comma, brace, bracket, colon)
-        // or nothing. However, we still want ' "a string"true ' to mark the 't' of 'true' as a potential
-        // pseudo-structural character just like we would if we had  ' "a string" true '; otherwise we
-        // may need to add an extra check when parsing strings.
-        //
-        // Performance: there are many ways to skin this cat.
-        const nonquote_scalar = characters.scalar() & ~string.quote;
-        const follows_nonquote_scalar = follows(nonquote_scalar, &parser.prev_scalar);
-        // if (unescaped & strings.in_string != 0) return error.UnescapedCharacters;
-        return Block{
-            .string = string, // strings is a function-local object so either it moves or the copy is elided.
-            .characters = characters,
-            .follows_nonquote_scalar = follows_nonquote_scalar,
-        };
-    }
-
-    fn nextChar(parser: *Parser, reader: anytype) !u8 {
-        if (parser.last_char) |lc| {
-            log("nextChar() using last_char '{c}'", .{lc});
-            defer parser.last_char = null;
-            return lc;
-        }
-        while (true) {
-            log("nextChar() index {}", .{parser.index});
-            // parser.dump();
-
-            log("{b:0>64} : quote", .{@bitReverse(u64, parser.block.string.quote >> parser.index << parser.index)});
-            const index = std.math.min(
-                @ctz(u64, parser.block.string.quote >> parser.index << parser.index),
-                @ctz(u64, parser.block.characters.op >> parser.index << parser.index),
-            );
-            log("nextChar() index2 {}", .{index});
-            if (index < step_size) {
-                const new_index = @truncate(I, index);
-                const result = parser.input_buf[new_index];
-                log("nextChar result '{c}'", .{result});
-                if (new_index == step_size - 1) {
-                    parser.block = try parser.nextBlock(reader);
-                } else parser.index = new_index + 1;
-                return result;
-            }
-            parser.block = try parser.nextBlock(reader);
-        }
-        unreachable;
-    }
-
-    fn nextToken(parser: *Parser, reader: anytype, comptime max_len: u32) ![]const u8 {
-        log("nextToken index {}", .{parser.index});
-        try parser.skipWs(reader);
-        // log("nextToken after skipWs index {}", .{parser.index});
-        // parser.dump();
-        const scalar = (parser.block.characters.whitespace | parser.block.characters.op) >> parser.index;
-        const token_len = if (scalar == 0) step_size - @as(u7, parser.index) else @ctz(u64, scalar);
-        log("{b:0>64} : scalar, token_len {}", .{ @bitReverse(u64, scalar), token_len });
-        const token_end = parser.index + std.math.min(token_len, max_len);
-        // const token_end = parser.index + token_len;
-        log("{b:0>64} : scalar, token_len {} token_end {}", .{ @bitReverse(u64, scalar), token_len, token_end });
-        const slice = if (token_end < step_size) blk: {
-            mem.copy(u8, &parser.token_buf, parser.input_buf[parser.index..token_end]);
-            break :blk parser.token_buf[0..token_len];
-        } else {
-            log("nextToken index 2 {}", .{parser.index});
-            mem.copy(u8, &parser.token_buf, parser.input_buf[parser.index..]);
-            parser.block = try parser.nextBlock(reader);
-            // parser.dump();
-            const scalar2 = (parser.block.characters.whitespace | parser.block.characters.op);
-            const token_len2 = @ctz(u64, scalar2);
-            log("{b:0>64} : scalar2, token_len2 {}", .{ @bitReverse(u64, scalar2), token_len2 });
-            const slice2 = if (token_len2 < step_size)
-                parser.input_buf[0..token_len2]
-            else
-                return error.TokenTooLong;
-            mem.copy(u8, parser.token_buf[token_len..], slice2);
-            parser.index = @truncate(I, token_len2);
-            return parser.token_buf[0..std.math.min(token_len + token_len2, max_len)];
-        };
-        log("nextToken slice '{s}'", .{slice});
-        parser.index += @truncate(I, slice.len);
-        return slice;
-    }
-
-    fn expectChar(parser: *Parser, comptime expected: u8, reader: anytype) !void {
-        log("expectChar('{c}')", .{expected});
-        const actual = try parser.nextChar(reader);
-        if (expected != actual) {
-            std.log.err("expecting '{c}' but found '{c}'", .{ expected, actual });
-            return error.UnexpectedChar;
-        }
-    }
-
-    fn skipWs(parser: *Parser, _: anytype) !void {
-        const mask = @as(u64, 1) << parser.index;
-        // log("{b:0>64}: mask", .{@bitReverse(u64, mask)});
-        // log("{b:0>64}: parser.block.characters.whitespace", .{@bitReverse(u64, parser.block.characters.whitespace)});
-
-        const is_next_ws = @boolToInt(mask & parser.block.characters.whitespace != 0);
-        parser.index += is_next_ws * try std.math.cast(I, @ctz(u64, ~parser.block.characters.whitespace >> parser.index));
-        // log("skipWs new index {}", .{parser.index});
-    }
-
-    fn incIndex(parser: *Parser, reader: anytype) !void {
-        if (@addWithOverflow(I, parser.index, 1, &parser.index))
-            parser.block = try parser.nextBlock(reader);
-    }
-
-    /// assumes parser.index is one past leading '"'
-    fn readString(parser: *Parser, reader: anytype) ![]const u8 {
-        parser.string_buf.items.len = 0;
-        while (true) {
-            const start = parser.index;
-            const new_index = @ctz(u64, parser.block.string.quote >> parser.index << parser.index);
-            try parser.string_buf.appendSlice(parser.allocator, parser.input_buf[start..new_index]);
-            log("readString start {} new_index {} string_buf '{s}'", .{ start, new_index, parser.string_buf.items });
-            if (new_index < step_size) {
-                parser.index = @truncate(I, new_index);
-                break;
-            }
-            parser.block = try parser.nextBlock(reader);
-        }
-        // skip trailing '"'
-        try parser.incIndex(reader);
-
-        return parser.string_buf.items;
-    }
-
-    /// assumes parser.index is one past a leading '"'
-    fn readStringAlloc(parser: *Parser, reader: anytype, options: Options) ![]u8 {
-        var list = std.ArrayListUnmanaged(u8){};
-        errdefer {
-            while (list.popOrNull()) |v|
-                parseFree(u8, v, options);
-            list.deinit(options.allocator);
-        }
-
-        while (true) {
-            const start = parser.index;
-            const new_index = @ctz(u64, parser.block.string.quote >> parser.index << parser.index);
-            try list.appendSlice(options.allocator, parser.input_buf[start..new_index]);
-            log("readStringAlloc start {} new_index {} string_buf '{s}'", .{ start, new_index, parser.string_buf.items });
-            if (new_index < step_size) {
-                parser.index = @truncate(I, new_index);
-                break;
-            }
-            parser.block = try parser.nextBlock(reader);
-        }
-        // skip trailing '"'
-        try parser.incIndex(reader);
-
-        return list.toOwnedSlice(options.allocator);
-    }
-
-    /// assumes parser.index is one past a leading '"'
-    fn skipString(parser: *Parser, reader: anytype) !void {
-        while (true) {
-            const new_index = @ctz(u64, parser.block.string.quote >> parser.index << parser.index);
-            if (new_index < step_size) {
-                parser.index = @truncate(I, new_index);
-                break;
-            }
-            parser.block = try parser.nextBlock(reader);
-        }
-        // skip trailing '"'
-        try parser.incIndex(reader);
-    }
-
-    fn readInt(parser: *Parser, comptime T: type, reader: anytype) !T {
-        try parser.skipWs(reader);
-        const tok = try parser.nextToken(reader, parser.token_buf.len);
-        return try std.fmt.parseInt(T, tok, 10);
-    }
-
-    fn readFloat(parser: *Parser, comptime T: type, reader: anytype) !T {
-        try parser.skipWs(reader);
-        const tok = try parser.nextToken(reader, parser.token_buf.len);
-        return try std.fmt.parseFloat(T, tok);
-    }
-
-    /// assumes parser.index is one past '['
-    pub fn readArrayAlloc(parser: *Parser, comptime T: type, reader: anytype, options: Options) ![]T {
-        var list = std.ArrayListUnmanaged(T){};
-        errdefer list.deinit(options.allocator);
-        while (true) {
-            try list.append(options.allocator, try parseImpl(T, parser, reader, options));
-            const next_char = parser.nextChar(reader) catch |err| switch (err) {
-                error.EndOfStream => return error.UnterminatedArray,
-                else => return err,
+        const Self = @This();
+        pub fn init(allocator: *mem.Allocator, reader: Reader) !Self {
+            var p: Self = .{
+                .allocator = allocator,
+                .block = undefined,
             };
-            switch (next_char) {
-                ',' => {},
-                ']' => break,
-                else => return error.InvalidArray,
+            p.block = try p.nextBlock(reader);
+            return p;
+        }
+        pub fn deinit(p: *Self) void {
+            p.string_buf.deinit(p.allocator);
+        }
+
+        inline fn nextStringBlock(self: *Self, input_vec: u8x64) StringBlock {
+            const backslash_vec = input_vec == @splat(64, @as(u8, '\\'));
+            const backslash = @bitCast(u64, backslash_vec);
+            const escaped = self.find_escaped(backslash);
+            const quote_vec = input_vec == @splat(64, @as(u8, '"'));
+            const quote = @bitCast(u64, quote_vec) & ~escaped;
+
+            //
+            // prefix_xor flips on bits inside the string (and flips off the end quote).
+            //
+            // Then we xor with prev_in_string: if we were in a string already, its effect is flipped
+            // (characters inside strings are outside, and characters outside strings are inside).
+            //
+            const ones: u64x2 = [1]u64{std.math.maxInt(u64)} ** 2;
+            var in_string = carrylessMul(.{ quote, 0 }, ones)[0];
+            // println("{b:0>64} | quote a", .{@bitReverse(u64, quote)});
+            // println("{b:0>64} | ones[0]", .{@bitReverse(u64, ones[0])});
+            // println("{b:0>64} | in_string a", .{@bitReverse(u64, in_string)});
+            // println("{b:0>64} | prev_in_string a", .{@bitReverse(u64, parser.prev_in_string)});
+            in_string ^= self.prev_in_string;
+            // println("{b:0>64} | in_string b", .{@bitReverse(u64, in_string)});
+
+            //
+            // Check if we're still in a string at the end of the box so the next block will know
+            //
+            // right shift of a signed value expected to be well-defined and standard
+            // compliant as of C++20, John Regher from Utah U. says this is fine code
+            //
+            // println("{b:0>64} | prev_in_string a", .{@bitReverse(u64, parser.prev_in_string)});
+            // println("{b:0>64} | @bitCast(i64, in_string) ", .{@bitReverse(i64, @bitCast(i64, in_string))});
+            // println("{b:0>64} | @bitCast(i64, in_string) >> 63 ", .{@bitReverse(i64, @bitCast(i64, in_string) >> 63)});
+            // println("{b:0>64} | @bitCast(u64, @bitCast(i64, in_string) >> 63) ", .{@bitReverse(u64, @bitCast(u64, @bitCast(i64, in_string) >> 63))});
+            self.prev_in_string = @bitCast(u64, @bitCast(i64, in_string) >> 63);
+
+            // Use ^ to turn the beginning quote off, and the end quote on.
+
+            // We are returning a function-local object so either we get a move constructor
+            // or we get copy elision.
+            return StringBlock{
+                .backslash = backslash,
+                .escaped = escaped,
+                .quote = quote,
+                .in_string = in_string,
+            };
+        }
+
+        inline fn follows(match: u64, overflow: *u64) u64 {
+            const result = match << 1 | overflow.*;
+            overflow.* = match >> 63;
+            return result;
+        }
+
+        fn nextBlock(self: *Self) !Block {
+            self.input_buf = [1]u8{0x20} ** step_size;
+            self.index = 0;
+            const n = try self.reader.read(&self.input_buf);
+            if (n == 0) return error.EndOfStream;
+            const string = self.nextStringBlock(self.input_buf);
+            // identifies the white-space and the structurat characters
+            const characters = CharacterBlock.classify(self.input_buf);
+
+            // The term "scalar" refers to anything except structural characters and white space
+            // (so letters, numbers, quotes).
+            // We want  follows_scalar to mark anything that follows a non-quote scalar (so letters and numbers).
+            //
+            // A terminal quote should either be followed by a structural character (comma, brace, bracket, colon)
+            // or nothing. However, we still want ' "a string"true ' to mark the 't' of 'true' as a potential
+            // pseudo-structural character just like we would if we had  ' "a string" true '; otherwise we
+            // may need to add an extra check when parsing strings.
+            //
+            // Performance: there are many ways to skin this cat.
+            const nonquote_scalar = characters.scalar() & ~string.quote;
+            const follows_nonquote_scalar = follows(nonquote_scalar, &self.prev_scalar);
+            // if (unescaped & strings.in_string != 0) return error.UnescapedCharacters;
+            return Block{
+                .string = string, // strings is a function-local object so either it moves or the copy is elided.
+                .characters = characters,
+                .follows_nonquote_scalar = follows_nonquote_scalar,
+            };
+        }
+
+        fn nextChar(self: *Self) !u8 {
+            if (self.last_char) |lc| {
+                log("nextChar() using last_char '{c}'", .{lc});
+                defer self.last_char = null;
+                return lc;
+            }
+            while (true) {
+                log("nextChar() index {}", .{self.index});
+                // parser.dump();
+
+                log("{b:0>64} : quote", .{@bitReverse(u64, self.block.string.quote >> self.index << self.index)});
+                const index = std.math.min(
+                    @ctz(u64, self.block.string.quote >> self.index << self.index),
+                    @ctz(u64, self.block.characters.op >> self.index << self.index),
+                );
+                log("nextChar() index2 {}", .{index});
+                if (index < step_size) {
+                    const new_index = @truncate(I, index);
+                    const result = self.input_buf[new_index];
+                    log("nextChar result '{c}'", .{result});
+                    if (new_index == step_size - 1) {
+                        self.block = try self.nextBlock();
+                    } else self.index = new_index + 1;
+                    return result;
+                }
+                self.block = try self.nextBlock();
+            }
+            unreachable;
+        }
+
+        fn nextToken(self: *Self, comptime max_len: u32) ![]const u8 {
+            log("nextToken index {}", .{self.index});
+            try self.skipWs();
+            // log("nextToken after skipWs index {}", .{self.index});
+            // self.dump();
+            const scalar = (self.block.characters.whitespace | self.block.characters.op) >> self.index;
+            const token_len = if (scalar == 0) step_size - @as(u7, self.index) else @ctz(u64, scalar);
+            log("{b:0>64} : scalar, token_len {}", .{ @bitReverse(u64, scalar), token_len });
+            const token_end = self.index + std.math.min(token_len, max_len);
+            // const token_end = self.index + token_len;
+            log("{b:0>64} : scalar, token_len {} token_end {}", .{ @bitReverse(u64, scalar), token_len, token_end });
+            const slice = if (token_end < step_size) blk: {
+                mem.copy(u8, &self.token_buf, self.input_buf[self.index..token_end]);
+                break :blk self.token_buf[0..token_len];
+            } else {
+                log("nextToken index 2 {}", .{self.index});
+                mem.copy(u8, &self.token_buf, self.input_buf[self.index..]);
+                self.block = try self.nextBlock();
+                // self.dump();
+                const scalar2 = (self.block.characters.whitespace | self.block.characters.op);
+                const token_len2 = @ctz(u64, scalar2);
+                log("{b:0>64} : scalar2, token_len2 {}", .{ @bitReverse(u64, scalar2), token_len2 });
+                const slice2 = if (token_len2 < step_size)
+                    self.input_buf[0..token_len2]
+                else
+                    return error.TokenTooLong;
+                mem.copy(u8, self.token_buf[token_len..], slice2);
+                self.index = @truncate(I, token_len2);
+                return self.token_buf[0..std.math.min(token_len + token_len2, max_len)];
+            };
+            log("nextToken slice '{s}'", .{slice});
+            self.index += @truncate(I, slice.len);
+            return slice;
+        }
+
+        fn expectChar(self: *Self, comptime expected: u8) !void {
+            log("expectChar('{c}')", .{expected});
+            const actual = try self.nextChar();
+            if (expected != actual) {
+                std.log.err("expecting '{c}' but found '{c}'", .{ expected, actual });
+                return error.UnexpectedChar;
             }
         }
-        return list.toOwnedSlice(options.allocator);
-    }
 
-    inline fn find_escaped(parser: *Parser, backslash_: u64) u64 {
-        // If there was overflow, pretend the first character isn't a backslash
-        var backslash = backslash_ & ~parser.prev_escaped;
-        const follows_escape = backslash << 1 | parser.prev_escaped;
+        fn skipWs(self: *Self) !void {
+            const mask = @as(u64, 1) << self.index;
+            // log("{b:0>64}: mask", .{@bitReverse(u64, mask)});
+            // log("{b:0>64}: self.block.characters.whitespace", .{@bitReverse(u64, self.block.characters.whitespace)});
 
-        // Get sequences starting on even bits by clearing out the odd series using +
-        const even_bits: u64 = 0x5555555555555555;
-        const odd_sequence_starts = backslash & ~even_bits & ~follows_escape;
-        var sequences_starting_on_even_bits: u64 = undefined;
-        // println("{b:0>64} | prev_escaped a", .{@bitReverse(u64, parser.prev_escaped)});
-        parser.prev_escaped = @boolToInt(@addWithOverflow(u64, odd_sequence_starts, backslash, &sequences_starting_on_even_bits));
-        // println("{b:0>64} | prev_escaped b", .{@bitReverse(u64, parser.prev_escaped)});
-        const invert_mask = sequences_starting_on_even_bits << 1; // The mask we want to return is the *escaped* bits, not escapes.
+            const is_next_ws = @boolToInt(mask & self.block.characters.whitespace != 0);
+            self.index += is_next_ws * try std.math.cast(I, @ctz(u64, ~self.block.characters.whitespace >> self.index));
+            // log("skipWs new index {}", .{self.index});
+        }
 
-        // Mask every other backslashed character as an escaped character
-        // Flip the mask for sequences that start on even bits, to correct them
-        return (even_bits ^ invert_mask) & follows_escape;
-    }
+        fn incIndex(self: *Self) !void {
+            if (@addWithOverflow(I, self.index, 1, &self.index))
+                self.block = try self.nextBlock();
+        }
 
-    fn nextStructuralIndex(parser: *Parser) u7 {
-        return @ctz(u64, parser.block.characters.op);
-    }
-    fn skipValue(parser: *Parser, reader: anytype) !void {
-        const Container = enum { arr, obj };
-        var containers: [256]Container = undefined;
-        var depth: u8 = 0;
+        /// assumes self.index is one past leading '"'
+        fn readString(self: *Self) ![]const u8 {
+            self.string_buf.items.len = 0;
+            while (true) {
+                const start = self.index;
+                const new_index = @ctz(u64, self.block.string.quote >> self.index << self.index);
+                try self.string_buf.appendSlice(self.allocator, self.input_buf[start..new_index]);
+                log("readString start {} new_index {} string_buf '{s}'", .{ start, new_index, self.string_buf.items });
+                if (new_index < step_size) {
+                    self.index = @truncate(I, new_index);
+                    break;
+                }
+                self.block = try self.nextBlock();
+            }
+            // skip trailing '"'
+            try self.incIndex();
 
-        while (true) {
-            const c = try parser.nextChar(reader);
-            log("skipValue '{c}' depth {}", .{ c, depth });
-            switch (c) {
-                '{' => {
-                    if (depth >= containers.len) return error.MaxDepthExceeded;
-                    containers[depth] = .obj;
-                    depth += 1;
-                },
-                '[' => {
-                    if (depth >= containers.len) return error.MaxDepthExceeded;
-                    containers[depth] = .arr;
-                    depth += 1;
-                },
-                '"' => try parser.skipString(reader),
-                ':' => {},
-                ',' => if (depth == 0) break,
-                '}' => {
-                    if (depth == 0) {
-                        parser.last_char = c;
-                        break;
+            return self.string_buf.items;
+        }
+
+        /// assumes self.index is one past a leading '"'
+        fn readStringAlloc(self: *Self, options: Options) ![]u8 {
+            var list = std.ArrayListUnmanaged(u8){};
+            errdefer {
+                while (list.popOrNull()) |v|
+                    parseFree(u8, v, options);
+                list.deinit(options.allocator);
+            }
+
+            while (true) {
+                const start = self.index;
+                const new_index = @ctz(u64, self.block.string.quote >> self.index << self.index);
+                try list.appendSlice(options.allocator, self.input_buf[start..new_index]);
+                log("readStringAlloc start {} new_index {} string_buf '{s}'", .{ start, new_index, self.string_buf.items });
+                if (new_index < step_size) {
+                    self.index = @truncate(I, new_index);
+                    break;
+                }
+                self.block = try self.nextBlock();
+            }
+            // skip trailing '"'
+            try self.incIndex();
+
+            return list.toOwnedSlice(options.allocator);
+        }
+
+        /// assumes self.index is one past a leading '"'
+        fn skipString(self: *Self) !void {
+            while (true) {
+                const new_index = @ctz(u64, self.block.string.quote >> self.index << self.index);
+                if (new_index < step_size) {
+                    self.index = @truncate(I, new_index);
+                    break;
+                }
+                self.block = try self.nextBlock();
+            }
+            // skip trailing '"'
+            try self.incIndex();
+        }
+
+        fn readInt(self: *Self, comptime T: type) !T {
+            try self.skipWs();
+            const tok = try self.nextToken(self.token_buf.len);
+            return try std.fmt.parseInt(T, tok, 10);
+        }
+
+        fn readFloat(self: *Self, comptime T: type) !T {
+            try self.skipWs();
+            const tok = try self.nextToken(self.token_buf.len);
+            return try std.fmt.parseFloat(T, tok);
+        }
+
+        /// assumes self.index is one past '['
+        fn readArrayAlloc(self: *Self, comptime T: type, options: Options) ![]T {
+            var list = std.ArrayListUnmanaged(T){};
+            errdefer list.deinit(options.allocator);
+            while (true) {
+                try list.append(options.allocator, try self.parseImpl(T, options));
+                const next_char = self.nextChar() catch |err| switch (err) {
+                    error.EndOfStream => return error.UnterminatedArray,
+                    else => return err,
+                };
+                switch (next_char) {
+                    ',' => {},
+                    ']' => break,
+                    else => return error.InvalidArray,
+                }
+            }
+            return list.toOwnedSlice(options.allocator);
+        }
+
+        inline fn find_escaped(self: *Self, backslash_: u64) u64 {
+            // If there was overflow, pretend the first character isn't a backslash
+            var backslash = backslash_ & ~self.prev_escaped;
+            const follows_escape = backslash << 1 | self.prev_escaped;
+
+            // Get sequences starting on even bits by clearing out the odd series using +
+            const even_bits: u64 = 0x5555555555555555;
+            const odd_sequence_starts = backslash & ~even_bits & ~follows_escape;
+            var sequences_starting_on_even_bits: u64 = undefined;
+            // println("{b:0>64} | prev_escaped a", .{@bitReverse(u64, self.prev_escaped)});
+            self.prev_escaped = @boolToInt(@addWithOverflow(u64, odd_sequence_starts, backslash, &sequences_starting_on_even_bits));
+            // println("{b:0>64} | prev_escaped b", .{@bitReverse(u64, self.prev_escaped)});
+            const invert_mask = sequences_starting_on_even_bits << 1; // The mask we want to return is the *escaped* bits, not escapes.
+
+            // Mask every other backslashed character as an escaped character
+            // Flip the mask for sequences that start on even bits, to correct them
+            return (even_bits ^ invert_mask) & follows_escape;
+        }
+
+        fn nextStructuralIndex(self: *Self) u7 {
+            return @ctz(u64, self.block.characters.op);
+        }
+        fn skipValue(self: *Self) !void {
+            const Container = enum { arr, obj };
+            var containers: [256]Container = undefined;
+            var depth: u8 = 0;
+
+            while (true) {
+                const c = try self.nextChar();
+                log("skipValue '{c}' depth {}", .{ c, depth });
+                switch (c) {
+                    '{' => {
+                        if (depth >= containers.len) return error.MaxDepthExceeded;
+                        containers[depth] = .obj;
+                        depth += 1;
+                    },
+                    '[' => {
+                        if (depth >= containers.len) return error.MaxDepthExceeded;
+                        containers[depth] = .arr;
+                        depth += 1;
+                    },
+                    '"' => try self.skipString(),
+                    ':' => {},
+                    ',' => if (depth == 0) break,
+                    '}' => {
+                        if (depth == 0) {
+                            self.last_char = c;
+                            break;
+                        }
+                        depth -= 1;
+                        if (containers[depth] != .obj) return error.UnexpectedObjectEnd;
+                    },
+                    ']' => {
+                        if (depth == 0) break;
+                        depth -= 1;
+                        if (containers[depth] != .arr) return error.UnexpectedArrayEnd;
+                    },
+                    else => {
+                        std.log.err("skipValue unexpected character '{c}' depth {}\n", .{ c, depth });
+                        return error.Unexpected;
+                    },
+                }
+            }
+        }
+
+        fn dump(self: Self) void {
+            log("", .{});
+            var buf_copy = [1]u8{0x20} ** step_size;
+            for (buf_copy) |*c, i| {
+                if (mem.indexOfScalar(u8, &std.ascii.spaces, self.input_buf[i]) == null)
+                    c.* = self.input_buf[i];
+            }
+            self.block.dump();
+            log(("0123456789" ** 7)[0..step_size], .{});
+            log("{s}: input_buf", .{&buf_copy});
+        }
+
+        fn parseImpl(self: *Self, comptime T: type, options: Options) !T {
+            log("-- parseImpl {s}", .{@typeName(T)});
+            defer log("-- done parseImpl {s}", .{@typeName(T)});
+
+            const tinfo = @typeInfo(T);
+            switch (tinfo) {
+                .Struct => |structInfo| {
+                    try self.expectChar('{');
+                    var result: T = undefined;
+                    var fields_seen = [_]bool{false} ** structInfo.fields.len;
+                    errdefer {
+                        inline for (structInfo.fields) |field, i| {
+                            if (fields_seen[i] and !field.is_comptime)
+                                parseFree(field.field_type, @field(result, field.name), options);
+                        }
                     }
-                    depth -= 1;
-                    if (containers[depth] != .obj) return error.UnexpectedObjectEnd;
+
+                    while (true) {
+                        const next_char = self.nextChar() catch |err| switch (err) {
+                            error.EndOfStream => break,
+                            else => return err,
+                        };
+                        log("parseImpl next_char '{c}'", .{next_char});
+                        switch (next_char) {
+                            '"' => {
+                                const key = self.readString() catch |err| switch (err) {
+                                    error.EndOfStream => break,
+                                    else => return err,
+                                };
+                                log("key {s}", .{key});
+                                try self.expectChar(':');
+                                inline for (structInfo.fields) |field, i| {
+                                    if (std.mem.eql(u8, key, field.name)) {
+                                        log("found key {s}", .{key});
+                                        if (field.is_comptime) {
+                                            const val = try self.parseImpl(field.field_type, options);
+                                            if (!std.meta.eql(val, field.default_value.?))
+                                                return error.UnexpectedValue;
+                                        } else {
+                                            @field(result, field.name) =
+                                                if (@hasDecl(T, "on_" ++ field.name))
+                                                try @field(T, "on_" ++ field.name)(options.allocator, self)
+                                            else
+                                                try self.parseImpl(field.field_type, options);
+                                        }
+                                        fields_seen[i] = true;
+                                        break;
+                                    }
+                                } else {
+                                    if (options.skip_unknown_fields) {
+                                        try self.skipValue();
+                                        continue;
+                                    } else return error.UnknownField;
+                                }
+                            },
+                            ',' => {}, // TODO: don't allow trailing comma
+                            ']' => {
+                                self.last_char = next_char;
+                                return result;
+                            },
+                            '}' => {
+                                self.last_char = next_char;
+                                break;
+                            },
+                            else => return error.InvalidCharacter,
+                        }
+                    } // end while(true)
+                    try self.expectChar('}');
+                    inline for (structInfo.fields) |field, i| {
+                        if (!fields_seen[i]) {
+                            if (field.default_value) |default| {
+                                if (!field.is_comptime)
+                                    @field(result, field.name) = default;
+                            } else return error.MissingField;
+                        }
+                    }
+                    return result;
                 },
-                ']' => {
-                    if (depth == 0) break;
-                    depth -= 1;
-                    if (containers[depth] != .arr) return error.UnexpectedArrayEnd;
+                .Pointer => |ptrInfo| switch (ptrInfo.size) {
+                    .Slice => {
+                        const next_char = try self.nextChar();
+                        switch (next_char) {
+                            '"' => {
+                                if (ptrInfo.child == u8) {
+                                    return try self.readStringAlloc(options);
+                                } else return error.UnsupportedStringType;
+                            },
+                            '[' => {
+                                const result = try self.readArrayAlloc(ptrInfo.child, options);
+                                return result;
+                            },
+                            else => return error.InvalidToken,
+                        }
+                    },
+                    .One => {
+                        var result = try options.allocator.create(ptrInfo.child);
+                        errdefer options.allocator.destroy(result);
+                        result.* = try self.parseImpl(ptrInfo.child, options);
+                        return result;
+                    },
+                    else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer size: {s}", .{@tagName(tinfo.Pointer.size)})),
                 },
-                else => {
-                    std.log.err("skipValue unexpected character '{c}' depth {}\n", .{ c, depth });
-                    return error.Unexpected;
+                .Int, .ComptimeInt => return self.readInt(T),
+                .Float, .ComptimeFloat => return self.readFloat(T),
+                .Bool => {
+                    try self.skipWs();
+                    const buf = try self.nextToken(4);
+
+                    log(".Bool '{s}' next '{c}' ", .{ buf, self.input_buf[self.index -| 1] });
+                    const i = std.mem.readIntSliceLittle(u32, buf);
+                    return switch (i) {
+                        std.mem.readIntLittle(u32, "true") => true,
+                        std.mem.readIntLittle(u32, "fals") => if (self.input_buf[self.index -| 1] == 'e') blk: {
+                            self.index += 1;
+                            break :blk false;
+                        } else error.InvalidBool,
+                        else => error.InvalidBool,
+                    };
                 },
+                .Optional => |optInfo| {
+                    try self.skipWs();
+                    const next_char = self.input_buf[self.index];
+                    return if (next_char == 'n') blk: {
+                        const tok = try self.nextToken(4);
+                        const i = std.mem.readIntLittle(u32, tok[0..4]);
+                        // log("buf '{s}' i {} - {}", .{ &buf, i, std.mem.readIntLittle(u24, "ull") });
+                        break :blk if (i == std.mem.readIntLittle(u32, "null")) @as(T, null) else error.InvalidOptional;
+                    } else blk: {
+                        break :blk try self.parseImpl(optInfo.child, options);
+                    };
+                },
+                .Enum => |enumInfo| {
+                    try self.skipWs();
+                    switch (self.input_buf[self.index]) {
+                        '0'...'9', '-' => {
+                            const tok = try self.nextToken(self.token_buf.len);
+                            const n = try std.fmt.parseInt(enumInfo.tag_type, tok, 10);
+                            return try std.meta.intToEnum(T, n);
+                        },
+                        '"' => {
+                            try self.incIndex();
+                            const str = try self.readString();
+                            return std.meta.stringToEnum(T, str) orelse return error.InvalidEnumTag;
+                        },
+                        else => return error.InvalidEnumToken,
+                    }
+                },
+                .Array => |arrInfo| {
+                    try self.skipWs();
+                    switch (self.input_buf[self.index]) {
+                        '[' => {
+                            try self.incIndex();
+                            var result: T = undefined;
+                            var i: usize = 0;
+                            errdefer {
+                                if (result.len > 0) while (true) : (i -= 1) {
+                                    parseFree(arrInfo.child, result[i], options);
+                                    if (i == 0) break;
+                                };
+                            }
+                            while (i < result.len) : (i += 1) {
+                                if (i > 0) try self.expectChar(',');
+                                result[i] = try self.parseImpl(arrInfo.child, options);
+                            }
+                            const char = self.nextChar() catch return error.UnexpectedEndOfJson;
+                            switch (char) {
+                                ']' => {},
+                                else => return error.UnexpectedToken,
+                            }
+                            return result;
+                        },
+                        '"' => {
+                            if (arrInfo.child != u8) return error.UnexpectedToken;
+                            try self.incIndex();
+                            var result: T = undefined;
+                            const str = try self.readString();
+                            mem.copy(u8, &result, str);
+                            return result;
+                        },
+                        else => return error.UnexpectedToken,
+                    }
+                    unreachable;
+                },
+                .Union => |unionInfo| {
+                    try self.expectChar('{');
+                    try self.expectChar('"');
+                    const key = self.readString() catch |err| switch (err) {
+                        error.EndOfStream => return error.InvalidUnionObject,
+                        else => return err,
+                    };
+                    log("union key {s}", .{key});
+                    try self.expectChar(':');
+                    inline for (unionInfo.fields) |field| {
+                        if (std.mem.eql(u8, key, field.name)) {
+                            var result = @unionInit(T, field.name, try self.parseImpl(field.field_type, options));
+                            errdefer parseFree(T, result, options);
+                            try self.expectChar('}');
+                            return result;
+                        }
+                    }
+                    return error.NoUnionMembersMatched;
+                },
+                else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
             }
         }
-    }
-
-    fn dump(parser: Parser) void {
-        log("", .{});
-        var buf_copy = [1]u8{0x20} ** step_size;
-        for (buf_copy) |*c, i| {
-            if (mem.indexOfScalar(u8, &std.ascii.spaces, parser.input_buf[i]) == null)
-                c.* = parser.input_buf[i];
-        }
-        parser.block.dump();
-        log(("0123456789" ** 7)[0..step_size], .{});
-        log("{s}: input_buf", .{&buf_copy});
-    }
-};
+    };
+}
 
 extern fn @"llvm.x86.avx2.pshuf.b"(a: u8x32, b: u8x32) u8x32;
-pub inline fn shuffleEpi8(a: u8x32, b: u8x32) u8x32 {
+inline fn shuffleEpi8(a: u8x32, b: u8x32) u8x32 {
     return @"llvm.x86.avx2.pshuf.b"(a, b);
 }
 
@@ -794,18 +822,18 @@ const Expected = union(enum) {
     token: []const u8,
 };
 
-fn expectNext(p: *Parser, reader: anytype, expected: Expected) !void {
+fn expectNext(p: anytype, expected: Expected) !void {
     switch (expected) {
         .char => {
-            const c = try p.nextChar(reader);
+            const c = try p.nextChar();
             try testing.expectEqual(expected.char, c);
         },
         .string => {
-            const s = try p.readString(reader);
+            const s = try p.readString();
             try testing.expectEqualStrings(expected.string, s);
         },
         .token => {
-            const s = try p.nextToken(reader, std.math.maxInt(u32));
+            const s = try p.nextToken(std.math.maxInt(u32));
             try testing.expectEqualStrings(expected.token, s);
         },
     }
@@ -817,33 +845,37 @@ test "nexts" {
         \\  {"asdf" : false,"bsdf":null }
     ;
     var fbs = std.io.fixedBufferStream(text);
-    var reader = fbs.reader();
-    var p = try Parser.init(std.heap.page_allocator, reader);
-    try expectNext(&p, reader, .{ .char = '{' });
-    try expectNext(&p, reader, .{ .char = '"' });
-    try expectNext(&p, reader, .{ .string = "asdf" });
-    try expectNext(&p, reader, .{ .char = ':' });
-    try expectNext(&p, reader, .{ .token = "false" });
-    try expectNext(&p, reader, .{ .char = ',' });
-    try expectNext(&p, reader, .{ .char = '"' });
-    try expectNext(&p, reader, .{ .string = "bsdf" });
-    try expectNext(&p, reader, .{ .char = ':' });
-    try expectNext(&p, reader, .{ .token = "null" });
-    try expectNext(&p, reader, .{ .char = '}' });
+    var p = try parser(testing.allocator, &fbs.reader());
+    defer p.deinit();
+    try expectNext(&p, .{ .char = '{' });
+    try expectNext(&p, .{ .char = '"' });
+    try expectNext(&p, .{ .string = "asdf" });
+    try expectNext(&p, .{ .char = ':' });
+    try expectNext(&p, .{ .token = "false" });
+    try expectNext(&p, .{ .char = ',' });
+    try expectNext(&p, .{ .char = '"' });
+    try expectNext(&p, .{ .string = "bsdf" });
+    try expectNext(&p, .{ .char = ':' });
+    try expectNext(&p, .{ .token = "null" });
+    try expectNext(&p, .{ .char = '}' });
 }
 
 test "span multiple blocks" {
     // testing.log_level = .debug;
     const input =
-        \\{                 "l":[10000,200000,3000000,18446744073709551615]}
+        //0123456789012345678901234567890123456789012345678901234567890123
+        \\{                 "l":[100000,200000,3000000,18446744073709551615]}
+        //                                                               ^ block ends here
     ;
-    var p: Parser = undefined;
-    try testing.expectEqual(@as(usize, 64), p.input_buf.len);
-    try testing.expectEqual(@as(usize, 66), input.len);
-    try testing.expectEqual(@as(u8, '5'), input[63]);
     var fbs = std.io.fixedBufferStream(input);
+    var p = try parser(testing.allocator, &fbs.reader());
+    try testing.expectEqual(@as(usize, 64), p.input_buf.len);
+    try testing.expectEqual(@as(usize, 67), input.len);
+    try testing.expectEqual(@as(u8, '1'), input[63]);
     const T = struct { l: []const usize };
-    const result = try parse(T, fbs.reader(), .{ .allocator = std.heap.page_allocator });
+    const options: Options = .{ .allocator = testing.allocator };
+    const result = try parseText(T, input, options);
+    defer parseFree(T, result, options);
     try testing.expectEqual(@as(usize, 4), result.l.len);
     try testing.expectEqual(@as(usize, 18446744073709551615), result.l[3]);
 }
@@ -853,19 +885,12 @@ test "twitter.json" {
     const f = try std.fs.cwd().openFile("testdata/twitter.json", .{ .read = true });
     defer f.close();
 
-    const Status = struct {
-        id: usize,
-    };
-    const Twitter = struct {
-        statuses: []const Status,
-    };
-
-    const res = try parse(Twitter, f.reader(), .{
-        .allocator = std.heap.page_allocator,
-        .skip_unknown_fields = true,
-    });
-    try testing.expectEqual(@as(usize, 1), res.statuses.len);
-    try testing.expectEqual(@as(usize, 505874924095815681), res.statuses[0].id);
+    const Status = struct { id: usize };
+    const Twitter = struct { statuses: []const Status };
+    const result = try parse(Twitter, f.reader(), .{ .allocator = testing.allocator });
+    defer parseFree(Twitter, result, .{ .allocator = testing.allocator });
+    try testing.expectEqual(@as(usize, 1), result.statuses.len);
+    try testing.expectEqual(@as(usize, 505874924095815681), result.statuses[0].id);
 }
 
 test "basic" {
@@ -897,9 +922,8 @@ test "basic" {
         union_enum: union(enum) { a: usize, b: []const u8 },
         default_missing: u8 = 66,
 
-        pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
-            _ = reader;
-            _ = try p.nextToken(reader, p.token_buf.len);
+        pub fn on_custom(_: *mem.Allocator, p: anytype) !u7 {
+            _ = try p.nextToken(p.token_buf.len);
             return 55;
         }
     };
@@ -928,10 +952,10 @@ test "basic" {
         \\ "union_enum": {"b": "bstr"},
         \\}
     ;
-    var fbs = std.io.fixedBufferStream(input);
-    const result = try parse(T, fbs.reader(), .{
-        .allocator = std.heap.page_allocator,
-    });
+    const options = Options{ .allocator = testing.allocator };
+    const result = try parseText(T, input, options);
+    defer parseFree(T, result, options);
+
     try testing.expectEqual(@as(u8, 42), result.num);
     try testing.expectEqualStrings("string", result.str);
     try testing.expect(result.bool1);
@@ -959,55 +983,40 @@ test "basic" {
 }
 
 test "unknown field" {
-    const input =
-        \\{"a":1}
-    ;
     const T = struct { b: u8 };
-    var fbs = std.io.fixedBufferStream(input);
-    try testing.expectError(error.UnknownField, parse(T, fbs.reader(), .{
-        .allocator = std.heap.page_allocator,
-        .skip_unknown_fields = false,
-    }));
+    try testing.expectError(error.UnknownField, parseText(T,
+        \\{"a":1}
+    , .{ .allocator = testing.allocator, .skip_unknown_fields = false }));
 }
 
 test "comptime fields" {
     {
-        const input =
+        const T = struct { comptime a: u8 = 44 };
+        try testing.expectError(error.UnexpectedValue, parseText(T,
             \\{"a":1}
-        ;
-        const T = struct {
-            comptime a: u8 = 44,
-        };
-        var fbs = std.io.fixedBufferStream(input);
-        try testing.expectError(error.UnexpectedValue, parse(T, fbs.reader(), .{
-            .allocator = std.heap.page_allocator,
+        , .{
+            .allocator = testing.allocator,
             .skip_unknown_fields = false,
         }));
     }
     {
-        const input =
+        const T = struct { comptime b: f32 = 1.1 };
+        try testing.expectError(error.UnexpectedValue, parseText(T,
             \\{"b": 2.2}
-        ;
-        const T = struct {
-            comptime b: f32 = 1.1,
-        };
-        var fbs = std.io.fixedBufferStream(input);
-        try testing.expectError(error.UnexpectedValue, parse(T, fbs.reader(), .{
-            .allocator = std.heap.page_allocator,
+        , .{
+            .allocator = testing.allocator,
             .skip_unknown_fields = false,
         }));
     }
     {
-        const input =
-            \\{"a": 44, "b": 1.1}
-        ;
         const T = struct {
             comptime a: u8 = 44,
             comptime b: f32 = 1.1,
         };
-        var fbs = std.io.fixedBufferStream(input);
-        _ = try parse(T, fbs.reader(), .{
-            .allocator = std.heap.page_allocator,
+        _ = try parseText(T,
+            \\{"a": 44, "b": 1.1}
+        , .{
+            .allocator = testing.allocator,
             .skip_unknown_fields = false,
         });
         // don't need to verify field values, just make sure the fields are found

@@ -37,9 +37,16 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
         @compileError(comptime std.fmt.comptimePrint("reader must be a pointer. found type '{s}'", .{@typeName(R)}));
     const tinfo = @typeInfo(T);
     switch (tinfo) {
-        .Struct => {
+        .Struct => |structInfo| {
             try parser.expectChar('{', reader);
             var result: T = undefined;
+            var fields_seen = [_]bool{false} ** structInfo.fields.len;
+            errdefer {
+                inline for (structInfo.fields) |field, i| {
+                    if (fields_seen[i] and !field.is_comptime)
+                        parseFree(field.field_type, @field(result, field.name), options);
+                }
+            }
 
             while (true) {
                 const next_char = parser.nextChar(reader) catch |err| switch (err) {
@@ -55,7 +62,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                         };
                         log("key {s}", .{key});
                         try parser.expectChar(':', reader);
-                        inline for (std.meta.fields(T)) |field| {
+                        inline for (structInfo.fields) |field, i| {
                             if (std.mem.eql(u8, key, field.name)) {
                                 log("found key {s}", .{key});
                                 if (field.is_comptime) {
@@ -69,6 +76,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                                     else
                                         try parseImpl(field.field_type, parser, reader, options);
                                 }
+                                fields_seen[i] = true;
                                 break;
                             }
                         } else {
@@ -91,28 +99,36 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 }
             } // end while(true)
             try parser.expectChar('}', reader);
+            inline for (structInfo.fields) |field, i| {
+                if (!fields_seen[i]) {
+                    if (field.default_value) |default| {
+                        if (!field.is_comptime)
+                            @field(result, field.name) = default;
+                    } else return error.MissingField;
+                }
+            }
             return result;
         },
-        .Pointer => switch (tinfo.Pointer.size) {
+        .Pointer => |ptrInfo| switch (ptrInfo.size) {
             .Slice => {
                 const next_char = try parser.nextChar(reader);
                 switch (next_char) {
                     '"' => {
-                        if (tinfo.Pointer.child == u8) {
+                        if (ptrInfo.child == u8) {
                             return try parser.readStringAlloc(reader, options);
                         } else return error.UnsupportedStringType;
                     },
                     '[' => {
-                        const result = try parser.readArrayAlloc(tinfo.Pointer.child, reader, options);
+                        const result = try parser.readArrayAlloc(ptrInfo.child, reader, options);
                         return result;
                     },
                     else => return error.InvalidToken,
                 }
             },
             .One => {
-                var result = try options.allocator.create(tinfo.Pointer.child);
+                var result = try options.allocator.create(ptrInfo.child);
                 errdefer options.allocator.destroy(result);
-                result.* = try parseImpl(tinfo.Pointer.child, parser, reader, options);
+                result.* = try parseImpl(ptrInfo.child, parser, reader, options);
                 return result;
             },
             else => @compileError(comptime std.fmt.comptimePrint("TODO Pointer size: {s}", .{@tagName(tinfo.Pointer.size)})),
@@ -134,7 +150,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 else => error.InvalidBool,
             };
         },
-        .Optional => {
+        .Optional => |optInfo| {
             try parser.skipWs(reader);
             const next_char = parser.input_buf[parser.index];
             return if (next_char == 'n') blk: {
@@ -143,15 +159,15 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 // log("buf '{s}' i {} - {}", .{ &buf, i, std.mem.readIntLittle(u24, "ull") });
                 break :blk if (i == std.mem.readIntLittle(u32, "null")) @as(T, null) else error.InvalidOptional;
             } else blk: {
-                break :blk try parseImpl(tinfo.Optional.child, parser, reader, options);
+                break :blk try parseImpl(optInfo.child, parser, reader, options);
             };
         },
-        .Enum => {
+        .Enum => |enumInfo| {
             try parser.skipWs(reader);
             switch (parser.input_buf[parser.index]) {
                 '0'...'9', '-' => {
                     const tok = try parser.nextToken(reader, parser.token_buf.len);
-                    const n = try std.fmt.parseInt(tinfo.Enum.tag_type, tok, 10);
+                    const n = try std.fmt.parseInt(enumInfo.tag_type, tok, 10);
                     return try std.meta.intToEnum(T, n);
                 },
                 '"' => {
@@ -162,17 +178,22 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                 else => return error.InvalidEnumToken,
             }
         },
-        .Array => {
+        .Array => |arrInfo| {
             try parser.skipWs(reader);
             switch (parser.input_buf[parser.index]) {
                 '[' => {
                     try parser.incIndex(reader);
                     var result: T = undefined;
-                    // TODO errdefer free i results
                     var i: usize = 0;
+                    errdefer {
+                        if (result.len > 0) while (true) : (i -= 1) {
+                            parseFree(arrInfo.child, result[i], options);
+                            if (i == 0) break;
+                        };
+                    }
                     while (i < result.len) : (i += 1) {
                         if (i > 0) try parser.expectChar(',', reader);
-                        result[i] = try parseImpl(tinfo.Array.child, parser, reader, options);
+                        result[i] = try parseImpl(arrInfo.child, parser, reader, options);
                     }
                     const char = parser.nextChar(reader) catch return error.UnexpectedEndOfJson;
                     switch (char) {
@@ -182,7 +203,7 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
                     return result;
                 },
                 '"' => {
-                    if (tinfo.Array.child != u8) return error.UnexpectedToken;
+                    if (arrInfo.child != u8) return error.UnexpectedToken;
                     try parser.incIndex(reader);
                     var result: T = undefined;
                     const str = try parser.readString(reader);
@@ -193,9 +214,8 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             }
             unreachable;
         },
-        .Union => {
+        .Union => |unionInfo| {
             try parser.expectChar('{', reader);
-            try parser.skipWs(reader);
             try parser.expectChar('"', reader);
             const key = parser.readString(reader) catch |err| switch (err) {
                 error.EndOfStream => return error.InvalidUnionObject,
@@ -203,10 +223,10 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             };
             log("union key {s}", .{key});
             try parser.expectChar(':', reader);
-            inline for (std.meta.fields(T)) |field| {
+            inline for (unionInfo.fields) |field| {
                 if (std.mem.eql(u8, key, field.name)) {
                     var result = @unionInit(T, field.name, try parseImpl(field.field_type, parser, reader, options));
-                    // TODO: errdefer parseFree(result);
+                    errdefer parseFree(T, result, options);
                     try parser.expectChar('}', reader);
                     return result;
                 }
@@ -214,6 +234,50 @@ fn parseImpl(comptime T: type, parser: *Parser, reader: anytype, options: Option
             return error.NoUnionMembersMatched;
         },
         else => @compileError(comptime std.fmt.comptimePrint("TODO: {s}", .{@tagName(tinfo)})),
+    }
+}
+
+/// Releases resources created by `parse`.
+/// Should be called with the same type and `ParseOptions` that were passed to `parse`
+pub fn parseFree(comptime T: type, value: T, options: Options) void {
+    switch (@typeInfo(T)) {
+        .Bool, .Float, .ComptimeFloat, .Int, .ComptimeInt, .Enum => {},
+        .Optional => if (value) |v| return parseFree(@TypeOf(v), v, options),
+        .Union => |unionInfo| {
+            if (unionInfo.tag_type) |UnionTagType| {
+                inline for (unionInfo.fields) |u_field| {
+                    if (value == @field(UnionTagType, u_field.name)) {
+                        parseFree(u_field.field_type, @field(value, u_field.name), options);
+                        break;
+                    }
+                }
+            } else unreachable;
+        },
+        .Struct => |structInfo| {
+            inline for (structInfo.fields) |field| {
+                if (!field.is_comptime)
+                    parseFree(field.field_type, @field(value, field.name), options);
+            }
+        },
+        .Array => |arrayInfo| {
+            for (value) |v|
+                parseFree(arrayInfo.child, v, options);
+        },
+        .Pointer => |ptrInfo| {
+            switch (ptrInfo.size) {
+                .One => {
+                    parseFree(ptrInfo.child, value.*, options);
+                    options.allocator.destroy(value);
+                },
+                .Slice => {
+                    for (value) |v|
+                        parseFree(ptrInfo.child, v, options);
+                    options.allocator.free(value);
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
     }
 }
 
@@ -469,7 +533,12 @@ pub const Parser = struct {
     /// assumes parser.index is one past a leading '"'
     fn readStringAlloc(parser: *Parser, reader: anytype, options: Options) ![]u8 {
         var list = std.ArrayListUnmanaged(u8){};
-        errdefer list.deinit(options.allocator);
+        errdefer {
+            while (list.popOrNull()) |v|
+                parseFree(u8, v, options);
+            list.deinit(options.allocator);
+        }
+
         while (true) {
             const start = parser.index;
             const new_index = @ctz(u64, parser.block.string.quote >> parser.index << parser.index);
@@ -800,31 +869,33 @@ test "twitter.json" {
 }
 
 test "basic" {
+    @setEvalBranchQuota(3000);
     // testing.log_level = .debug;
     const E = enum { a, b };
     const T = struct {
-        a: u8,
-        b: []const u8, // string
-        c: bool,
-        d: bool,
-        e: ?u8, // optional
-        f: ?u8,
-        g: ?i8,
-        h: ?f32,
-        i: f32, // float
-        j: []u8, // slice from array
-        k: struct { a: u8 },
-        l: []usize, // non u8 slice
-        custom: u8, // using on_custom method
-        m: u128,
-        n: f64,
-        o: *u8, // pointer to one
-        p: E, // enum
-        q: E,
-        r: [2]u8, // array
-        s: [2]u8,
-        t: union { a: usize, b: []const u8 }, // bare union
-        u: union(enum) { a: usize, b: []const u8 }, // union(enum)
+        num: u8,
+        str: []const u8,
+        bool1: bool,
+        bool2: bool,
+        opt_null: ?u8,
+        opt_42: ?u8,
+        opt_neg42: ?i8,
+        opt_float422: ?f32,
+        float422: f32,
+        slice_arr: []u8,
+        nested_struct: struct { a: u8 },
+        slice_nonu8: []usize,
+        custom: u8, // uses on_custom method
+        num_large: u128,
+        float_large: f64,
+        ptr_one: *u8,
+        enum1: E,
+        enum2: E,
+        arr1: [2]u8,
+        arr2: [2]u8,
+        union_bare: union { a: usize, b: []const u8 },
+        union_enum: union(enum) { a: usize, b: []const u8 },
+        default_missing: u8 = 66,
 
         pub fn on_custom(reader: anytype, _: *mem.Allocator, p: *Parser) !u8 {
             _ = reader;
@@ -833,55 +904,58 @@ test "basic" {
         }
     };
     const input =
-        \\ { "a" : 42 ,
-        \\ "b" : "string",
-        \\ "c" : true,
-        \\ "d":false,
-        \\ "e": null,
-        \\ "f":42,
-        \\ "g":-42,
-        \\ "h":42.2,
-        \\ "i":42.2,
-        \\ "j": [ 1 , 2 , 3 ], 
-        \\ "k":{"a":42},
-        \\ "l":[10000,200000,3000000,18446744073709551615],
-        \\ "m": 340282366920938463463374607431768211455,
-        \\ "n": 1.7976931348623157e+308,
+        \\ { "num" : 42 ,
+        \\ "str" : "string",
+        \\ "bool1" : true,
+        \\ "bool2":false,
+        \\ "opt_null": null,
+        \\ "opt_42":42,
+        \\ "opt_neg42":-42,
+        \\ "opt_float422":42.2,
+        \\ "float422":42.2,
+        \\ "slice_arr": [ 1 , 2 , 3 ] , 
+        \\ "nested_struct":{"a":42},
+        \\ "slice_nonu8":[10000,200000,3000000,18446744073709551615],
+        \\ "num_large": 340282366920938463463374607431768211455,
+        \\ "float_large": 1.7976931348623157e+308,
         \\"custom":66,
-        \\ "o": 101,
-        \\ "p": 0,
-        \\ "q": "a",
-        \\ "r": [1,2],
-        \\ "s": "ab",
-        \\ "t": {"a": 42},
-        \\ "u": {"b": "bstr"},
+        \\ "ptr_one": 101,
+        \\ "enum1": 0,
+        \\ "enum2": "b",
+        \\ "arr1": [1,2],
+        \\ "arr2": "ab",
+        \\ "union_bare": {"a": 42},
+        \\ "union_enum": {"b": "bstr"},
         \\}
     ;
     var fbs = std.io.fixedBufferStream(input);
     const result = try parse(T, fbs.reader(), .{
         .allocator = std.heap.page_allocator,
     });
-    try testing.expectEqual(@as(u8, 42), result.a);
-    try testing.expectEqualStrings("string", result.b);
-    try testing.expect(result.c);
-    try testing.expect(!result.d);
-    try testing.expectEqual(@as(?u8, 42), result.f);
-    try testing.expectEqual(@as(?i8, -42), result.g);
-    try testing.expect(result.h != null);
-    try testing.expectApproxEqAbs(@as(f32, 42.2), result.h.?, std.math.epsilon(f32));
-    try testing.expectApproxEqAbs(@as(f32, 42.2), result.i, std.math.epsilon(f32));
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, result.j);
-    try testing.expectEqual(@as(u8, 42), result.k.a);
-    try testing.expectEqualSlices(usize, &[_]usize{ 10_000, 200_000, 3_000_000, std.math.maxInt(usize) }, result.l);
+    try testing.expectEqual(@as(u8, 42), result.num);
+    try testing.expectEqualStrings("string", result.str);
+    try testing.expect(result.bool1);
+    try testing.expect(!result.bool2);
+    try testing.expect(result.opt_null == null);
+    try testing.expectEqual(@as(?u8, 42), result.opt_42);
+    try testing.expectEqual(@as(?i8, -42), result.opt_neg42);
+    try testing.expect(result.opt_float422 != null);
+    try testing.expectApproxEqAbs(@as(f32, 42.2), result.opt_float422.?, std.math.epsilon(f32));
+    try testing.expectApproxEqAbs(@as(f32, 42.2), result.float422, std.math.epsilon(f32));
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, result.slice_arr);
+    try testing.expectEqual(@as(u8, 42), result.nested_struct.a);
+    try testing.expectEqualSlices(usize, &[_]usize{ 10_000, 200_000, 3_000_000, std.math.maxInt(usize) }, result.slice_nonu8);
     try testing.expectEqual(@as(u8, 55), result.custom);
-    try testing.expectEqual(@as(u128, std.math.maxInt(u128)), result.m);
-    try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.n, std.math.epsilon(f64));
-    try testing.expectEqual(E.a, result.p);
-    try testing.expectEqual(E.a, result.q);
-    try testing.expectEqual([_]u8{ 1, 2 }, result.r);
-    try testing.expectEqualStrings("ab", &result.s);
-    try testing.expectEqual(@as(usize, 42), result.t.a);
-    try testing.expectEqualStrings("bstr", result.u.b);
+    try testing.expectEqual(@as(u128, std.math.maxInt(u128)), result.num_large);
+    try testing.expectApproxEqAbs(@as(f64, std.math.f64_max), result.float_large, std.math.epsilon(f64));
+    try testing.expectEqual(E.a, result.enum1);
+    try testing.expectEqual(E.b, result.enum2);
+    try testing.expectEqual([_]u8{ 1, 2 }, result.arr1);
+    try testing.expectEqualStrings("ab", &result.arr2);
+    try testing.expectEqual(@as(usize, 42), result.union_bare.a);
+    try testing.expect(result.union_enum == .b);
+    try testing.expectEqualStrings("bstr", result.union_enum.b);
+    try testing.expectEqual(@as(u8, 66), result.default_missing);
 }
 
 test "unknown field" {

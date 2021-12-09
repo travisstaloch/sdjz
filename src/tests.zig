@@ -111,7 +111,7 @@ test "basic" {
         union_enum: union(enum) { a: usize, b: []const u8 },
         default_missing: u8 = 66,
 
-        pub fn on_custom(_: *mem.Allocator, p: anytype) !u7 {
+        pub fn on_custom(_: mem.Allocator, p: anytype) !u7 {
             _ = try p.nextToken(p.token_buf.len);
             return 55;
         }

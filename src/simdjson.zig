@@ -10,7 +10,7 @@ const Log2StepSizeInt = std.meta.Int(.unsigned, std.math.log2_int(u8, step_size)
 
 pub const Options = struct {
     /// allocator to use when pointer or slice fields are found
-    allocator: *mem.Allocator,
+    allocator: mem.Allocator,
 
     /// if false, unknown fields will cause an error.UnknownField
     /// otherwise they will be skipped. defaults to true.
@@ -20,7 +20,7 @@ pub const Options = struct {
 /// helper around `parseUnbuffered` with a `std.io.bufferedReader(reader)`.
 /// if T includes methods such as `on_field` 
 /// with the following signature, they will be called when `field` is found: 
-///   `pub fn on_field(reader: anytype, allocator: *mem.Allocator, p: *Parser) !Ret`.
+///   `pub fn on_field(reader: anytype, allocator: mem.Allocator, p: *Parser) !Ret`.
 /// the return type Ret must coerce to the type of `field`.
 pub fn parse(comptime T: type, reader: anytype, options: Options) !T {
     var buffered_reader = std.io.bufferedReader(reader);
@@ -85,7 +85,7 @@ pub fn parseFree(comptime T: type, value: T, options: Options) void {
 }
 
 /// initializes a Parser(Reader) and loads a block
-pub fn parser(allocator: *mem.Allocator, reader: anytype) !Parser(@TypeOf(reader)) {
+pub fn parser(allocator: mem.Allocator, reader: anytype) !Parser(@TypeOf(reader)) {
     var p: Parser(@TypeOf(reader)) = .{
         .allocator = allocator,
         .block = undefined,
@@ -131,7 +131,7 @@ pub fn Parser(comptime Reader: type) type {
         @compileError(comptime std.fmt.comptimePrint("reader must be a pointer. found type '{s}'", .{@typeName(Reader)}));
 
     return struct {
-        allocator: *mem.Allocator,
+        allocator: mem.Allocator,
         prev_escaped: u64 = 0,
         prev_scalar: u64 = 0,
         prev_in_string: u64 = 0,
@@ -148,7 +148,7 @@ pub fn Parser(comptime Reader: type) type {
         reader: Reader,
 
         const Self = @This();
-        pub fn init(allocator: *mem.Allocator, reader: Reader) !Self {
+        pub fn init(allocator: mem.Allocator, reader: Reader) !Self {
             var p: Self = .{
                 .allocator = allocator,
                 .block = undefined,
